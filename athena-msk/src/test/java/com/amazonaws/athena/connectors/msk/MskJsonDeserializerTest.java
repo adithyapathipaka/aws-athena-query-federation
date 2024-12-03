@@ -24,7 +24,6 @@ import com.amazonaws.athena.connectors.msk.dto.TopicSchema;
 import com.amazonaws.athena.connectors.msk.serde.MskJsonDeserializer;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.kafka.common.errors.SerializationException;
 import org.junit.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -63,8 +62,6 @@ public class MskJsonDeserializerTest extends MskAbstractDeserializerTest
     private TopicSchema createJsonTopicSchema() throws JsonProcessingException
     {
         String json = "{" +
-                "\"tableName\":\"test\"," +
-                "\"schemaName\":\"default\"," +
                 "\"topicName\":\"test\"," +
                 "\"message\":{" +
                 "\"dataFormat\":\"json\"," +

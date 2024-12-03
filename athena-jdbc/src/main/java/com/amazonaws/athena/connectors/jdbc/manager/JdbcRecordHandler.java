@@ -53,9 +53,7 @@ import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionConfig;
 import com.amazonaws.athena.connectors.jdbc.connection.JdbcConnectionFactory;
 import com.amazonaws.athena.connectors.jdbc.connection.JdbcCredentialProvider;
 import com.amazonaws.athena.connectors.jdbc.connection.RdsSecretsCredentialProvider;
-import com.amazonaws.services.athena.AmazonAthena;
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.secretsmanager.AWSSecretsManager;
+import com.amazonaws.athena.connectors.jdbc.qpt.JdbcQueryPassthrough;
 import org.apache.arrow.util.VisibleForTesting;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.holders.NullableBigIntHolder;
@@ -75,17 +73,20 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Validate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.athena.AthenaClient;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
 import java.sql.Array;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Abstracts JDBC record handler and provides common reusable split records handling.
@@ -97,20 +98,27 @@ public abstract class JdbcRecordHandler
     private final JdbcConnectionFactory jdbcConnectionFactory;
     private final DatabaseConnectionConfig databaseConnectionConfig;
 
+    protected final JdbcQueryPassthrough queryPassthrough = new JdbcQueryPassthrough();
+
     /**
      * Used only by Multiplexing handler. All invocations will be delegated to respective database handler.
      */
-    protected JdbcRecordHandler(String sourceType)
+    protected JdbcRecordHandler(String sourceType, java.util.Map<String, String> configOptions)
     {
-        super(sourceType);
+        super(sourceType, configOptions);
         this.jdbcConnectionFactory = null;
         this.databaseConnectionConfig = null;
     }
 
-    protected JdbcRecordHandler(final AmazonS3 amazonS3, final AWSSecretsManager secretsManager, AmazonAthena athena, final DatabaseConnectionConfig databaseConnectionConfig,
-            final JdbcConnectionFactory jdbcConnectionFactory)
+    protected JdbcRecordHandler(
+        S3Client amazonS3,
+        SecretsManagerClient secretsManager,
+        AthenaClient athena,
+        DatabaseConnectionConfig databaseConnectionConfig,
+        JdbcConnectionFactory jdbcConnectionFactory,
+        java.util.Map<String, String> configOptions)
     {
-        super(amazonS3, secretsManager, athena, databaseConnectionConfig.getEngine());
+        super(amazonS3, secretsManager, athena, databaseConnectionConfig.getEngine(), configOptions);
         this.jdbcConnectionFactory = Validate.notNull(jdbcConnectionFactory, "jdbcConnectionFactory must not be null");
         this.databaseConnectionConfig = Validate.notNull(databaseConnectionConfig, "databaseConnectionConfig must not be null");
     }
@@ -195,7 +203,6 @@ public abstract class JdbcRecordHandler
     protected Extractor makeExtractor(Field field, ResultSet resultSet, Map<String, String> partitionValues)
     {
         Types.MinorType fieldType = Types.getMinorTypeForArrowType(field.getType());
-
         final String fieldName = field.getName();
 
         if (partitionValues.containsKey(fieldName)) {
@@ -247,7 +254,14 @@ public abstract class JdbcRecordHandler
             case FLOAT8:
                 return (Float8Extractor) (Object context, NullableFloat8Holder dst) ->
                 {
-                    dst.value = resultSet.getDouble(fieldName);
+                    try {
+                        dst.value = resultSet.getDouble(fieldName);
+                    }
+                    catch (java.sql.SQLException ex) {
+                        // We need to use Double.parseDouble()
+                        // replaceAll() use to strip commas "$25,000.00"
+                        dst.value = Double.parseDouble(resultSet.getString(fieldName).replaceAll(",", "").replaceAll("\\$", ""));
+                    }
                     dst.isSet = resultSet.wasNull() ? 0 : 1;
                 };
             case DECIMAL:
@@ -259,8 +273,9 @@ public abstract class JdbcRecordHandler
             case DATEDAY:
                 return (DateDayExtractor) (Object context, NullableDateDayHolder dst) ->
                 {
+                    //Issue fix for getting different date (offset by 1) for any dates prior to 1/1/1970.
                     if (resultSet.getDate(fieldName) != null) {
-                        dst.value = (int) TimeUnit.MILLISECONDS.toDays(resultSet.getDate(fieldName).getTime());
+                        dst.value = (int) LocalDate.parse(resultSet.getDate(fieldName).toString()).toEpochDay();
                     }
                     dst.isSet = resultSet.wasNull() ? 0 : 1;
                 };
@@ -305,4 +320,13 @@ public abstract class JdbcRecordHandler
      */
     public abstract PreparedStatement buildSplitSql(Connection jdbcConnection, String catalogName, TableName tableName, Schema schema, Constraints constraints, Split split)
             throws SQLException;
+
+    public PreparedStatement buildQueryPassthroughSql(Connection jdbcConnection, Constraints constraints) throws SQLException
+    {
+        PreparedStatement preparedStatement;
+        queryPassthrough.verify(constraints.getQueryPassthroughArguments());
+        String clientPassQuery = constraints.getQueryPassthroughArguments().get(JdbcQueryPassthrough.QUERY);
+        preparedStatement = jdbcConnection.prepareStatement(clientPassQuery);
+        return preparedStatement;
+    }
 }

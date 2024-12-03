@@ -43,11 +43,6 @@ import com.amazonaws.athena.connector.lambda.security.EncryptionKey;
 import com.amazonaws.athena.connector.lambda.security.EncryptionKeyFactory;
 import com.amazonaws.athena.connector.lambda.security.FederatedIdentity;
 import com.amazonaws.athena.connector.lambda.security.LocalKeyFactory;
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.model.PutObjectRequest;
-import com.amazonaws.services.s3.model.PutObjectResult;
-import com.amazonaws.services.s3.model.S3Object;
-import com.amazonaws.services.s3.model.S3ObjectInputStream;
 import com.google.common.io.ByteStreams;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -56,10 +51,19 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
+import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
+import org.mockito.stubbing.Answer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
@@ -70,10 +74,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static com.amazonaws.athena.connector.lambda.domain.predicate.Constraints.DEFAULT_NO_LIMIT;
 import static org.junit.Assert.*;
-import static org.mockito.Matchers.anyObject;
-import static org.mockito.Matchers.anyString;
-import static org.mockito.Mockito.mock;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -97,7 +100,7 @@ public abstract class AbstractTableProviderTest
     private final List<ByteHolder> mockS3Store = new ArrayList<>();
 
     @Mock
-    private AmazonS3 amazonS3;
+    private S3Client amazonS3;
 
     @Mock
     private QueryStatusChecker queryStatusChecker;
@@ -127,31 +130,31 @@ public abstract class AbstractTableProviderTest
     {
         allocator = new BlockAllocatorImpl();
 
-        when(amazonS3.putObject(anyObject()))
+        when(amazonS3.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
                 .thenAnswer((InvocationOnMock invocationOnMock) -> {
-                    InputStream inputStream = ((PutObjectRequest) invocationOnMock.getArguments()[0]).getInputStream();
+                    InputStream inputStream = ((RequestBody) invocationOnMock.getArguments()[1]).contentStreamProvider().newStream();
                     ByteHolder byteHolder = new ByteHolder();
                     byteHolder.setBytes(ByteStreams.toByteArray(inputStream));
                     mockS3Store.add(byteHolder);
-                    return mock(PutObjectResult.class);
+                    return PutObjectResponse.builder().build();
                 });
 
-        when(amazonS3.getObject(anyString(), anyString()))
-                .thenAnswer((InvocationOnMock invocationOnMock) -> {
-                    S3Object mockObject = mock(S3Object.class);
-                    ByteHolder byteHolder = mockS3Store.get(0);
-                    mockS3Store.remove(0);
-                    when(mockObject.getObjectContent()).thenReturn(
-                            new S3ObjectInputStream(
-                                    new ByteArrayInputStream(byteHolder.getBytes()), null));
-                    return mockObject;
+        when(amazonS3.getObject(any(GetObjectRequest.class)))
+                .thenAnswer(new Answer<Object>()
+                {
+                    @Override
+                    public Object answer(InvocationOnMock invocationOnMock)
+                            throws Throwable
+                    {
+                        return new ResponseInputStream<>(GetObjectResponse.builder().build(), new ByteArrayInputStream(mockS3Store.get(0).getBytes()));
+                    }
                 });
 
         blockSpillReader = new S3BlockSpillReader(amazonS3, allocator);
 
         provider = setUpSource();
 
-        when(queryStatusChecker.isQueryRunning()).thenReturn(true);
+        Mockito.lenient().when(queryStatusChecker.isQueryRunning()).thenReturn(true);
     }
 
     @After
@@ -176,7 +179,7 @@ public abstract class AbstractTableProviderTest
     @Test
     public void readTableTest()
     {
-        GetTableRequest request = new GetTableRequest(identity, expectedQuery, expectedCatalog, expectedTableName);
+        GetTableRequest request = new GetTableRequest(identity, expectedQuery, expectedCatalog, expectedTableName, Collections.emptyMap());
         GetTableResponse response = provider.getTable(allocator, request);
         assertTrue(response.getSchema().getFields().size() > 1);
 
@@ -186,7 +189,7 @@ public abstract class AbstractTableProviderTest
                 EquatableValueSet.newBuilder(allocator, Types.MinorType.VARCHAR.getType(), true, false)
                         .add(idValue).build());
 
-        Constraints constraints = new Constraints(constraintsMap);
+        Constraints constraints = new Constraints(constraintsMap, Collections.emptyList(), Collections.emptyList(), DEFAULT_NO_LIMIT);
 
         ConstraintEvaluator evaluator = new ConstraintEvaluator(allocator, response.getSchema(), constraints);
 
@@ -218,7 +221,7 @@ public abstract class AbstractTableProviderTest
 
         setUpRead();
 
-        BlockSpiller spiller = new S3BlockSpiller(amazonS3, spillConfig, allocator, response.getSchema(), evaluator);
+        BlockSpiller spiller = new S3BlockSpiller(amazonS3, spillConfig, allocator, response.getSchema(), evaluator, com.google.common.collect.ImmutableMap.of());
         provider.readWithConstraint(spiller, readRequest, queryStatusChecker);
 
         validateRead(response.getSchema(), blockSpillReader, spiller.getSpillLocations(), spillConfig.getEncryptionKey());

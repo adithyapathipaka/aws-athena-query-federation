@@ -28,9 +28,6 @@ import com.amazonaws.athena.connector.lambda.domain.predicate.Constraints;
 import com.amazonaws.athena.connector.lambda.metadata.*;
 import com.amazonaws.athena.connector.lambda.security.FederatedIdentity;
 import com.amazonaws.athena.connector.lambda.security.LocalKeyFactory;
-import com.amazonaws.services.athena.AmazonAthena;
-import com.amazonaws.services.glue.AWSGlue;
-import com.amazonaws.services.secretsmanager.AWSSecretsManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -39,6 +36,13 @@ import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.elasticsearch.client.IndicesClient;
+import org.elasticsearch.client.RequestOptions;
+import org.elasticsearch.client.indices.DataStream;
+import org.elasticsearch.client.indices.GetDataStreamRequest;
+import org.elasticsearch.client.indices.GetDataStreamResponse;
+import org.elasticsearch.client.indices.GetIndexRequest;
+import org.elasticsearch.client.indices.GetIndexResponse;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -47,14 +51,29 @@ import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.athena.AthenaClient;
+import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
 import java.io.IOException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Set;
 
 import static com.amazonaws.athena.connector.lambda.metadata.ListTablesRequest.UNLIMITED_PAGE_SIZE_VALUE;
-import static org.junit.Assert.*;
+import static com.amazonaws.athena.connector.lambda.domain.predicate.Constraints.DEFAULT_NO_LIMIT;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.Mockito.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
@@ -71,13 +90,13 @@ public class ElasticsearchMetadataHandlerTest
     private BlockAllocatorImpl allocator;
 
     @Mock
-    private AWSGlue awsGlue;
+    private GlueClient awsGlue;
 
     @Mock
-    private AWSSecretsManager awsSecretsManager;
+    private SecretsManagerClient awsSecretsManager;
 
     @Mock
-    private AmazonAthena amazonAthena;
+    private AthenaClient amazonAthena;
 
     @Mock
     private AwsRestHighLevelClient mockClient;
@@ -94,7 +113,7 @@ public class ElasticsearchMetadataHandlerTest
         logger.info("setUpBefore - enter");
 
         allocator = new BlockAllocatorImpl();
-        when(clientFactory.getOrCreateClient(anyString())).thenReturn(mockClient);
+        when(clientFactory.getOrCreateClient(nullable(String.class))).thenReturn(mockClient);
 
         logger.info("setUpBefore - exit");
     }
@@ -122,7 +141,7 @@ public class ElasticsearchMetadataHandlerTest
                 "domain2", "endpoint2","domain3", "endpoint3"));
 
         handler = new ElasticsearchMetadataHandler(awsGlue, new LocalKeyFactory(), awsSecretsManager, amazonAthena,
-                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory, 10);
+                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory, 10, ImmutableMap.of());
 
         ListSchemasRequest req = new ListSchemasRequest(fakeIdentity(), "queryId", "elasticsearch");
         ListSchemasResponse realDomains = handler.doListSchemaNames(allocator, req);
@@ -178,15 +197,25 @@ public class ElasticsearchMetadataHandlerTest
 
         // Hardcoded response with 2 indices.
         Collection<TableName> mockIndices = ImmutableList.of(new TableName("movies", "customer"),
-                new TableName("movies", "movies"));
+                new TableName("movies", "movies"),
+                new TableName("movies", "stream1"),
+                new TableName("movies", "stream2"));
 
         // Get real indices.
         when(domainMapProvider.getDomainMap(null)).thenReturn(ImmutableMap.of("movies",
                 "https://search-movies-ne3fcqzfipy6jcrew2wca6kyqu.us-east-1.es.amazonaws.com"));
         handler = new ElasticsearchMetadataHandler(awsGlue, new LocalKeyFactory(), awsSecretsManager, amazonAthena,
-                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory, 10);
-        when(mockClient.getAliases()).thenReturn(ImmutableSet.of("movies", ".kibana_1", "customer"));
+                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory, 10, ImmutableMap.of());
 
+        IndicesClient indices = mock(IndicesClient.class);
+        GetDataStreamResponse mockIndexResponse = mock(GetDataStreamResponse.class);
+        when(mockIndexResponse.getDataStreams()).thenReturn(
+                ImmutableList.of(new DataStream("stream1", "ts",ImmutableList.of("index1", "index2"), 0, null, null, null),
+                        new DataStream("stream2", "ts",ImmutableList.of("index7", "index8"), 0, null, null, null)));
+        when(indices.getDataStream(nullable(GetDataStreamRequest.class), eq(RequestOptions.DEFAULT))).thenReturn(mockIndexResponse);
+        when(mockClient.indices()).thenReturn(indices);
+
+        when(mockClient.getAliases()).thenReturn(ImmutableSet.of("movies", ".kibana_1", "customer"));
         ListTablesRequest req = new ListTablesRequest(fakeIdentity(),
                 "queryId", "elasticsearch", "movies", null, UNLIMITED_PAGE_SIZE_VALUE);
         Collection<TableName> realIndices = handler.doListTables(allocator, req).getTables();
@@ -254,8 +283,8 @@ public class ElasticsearchMetadataHandlerTest
                 .addField(new Field("myscaled",
                         new FieldType(true, Types.MinorType.BIGINT.getType(), null,
                                 ImmutableMap.of("scaling_factor", "10.0")), null))
-                .addField("myfloat", Types.MinorType.FLOAT4.getType())
-                .addField("myhalf", Types.MinorType.FLOAT4.getType())
+                .addField("myfloat", Types.MinorType.FLOAT8.getType())
+                .addField("myhalf", Types.MinorType.FLOAT8.getType())
                 .addField("mydatemilli", Types.MinorType.DATEMILLI.getType())
                 .addField("mydatenano", Types.MinorType.DATEMILLI.getType())
                 .addField("myboolean", Types.MinorType.BIT.getType())
@@ -299,10 +328,10 @@ public class ElasticsearchMetadataHandlerTest
                 "          \"type\" : \"double\"\n" +                   // type: double (FLOAT8)
                 "        },\n" +
                 "        \"myfloat\" : {\n" +                           // myfloat:
-                "          \"type\" : \"float\"\n" +                    // type: float (FLOAT4)
+                "          \"type\" : \"float\"\n" +                    // type: float (FLOAT8)
                 "        },\n" +
                 "        \"myhalf\" : {\n" +                            // myhalf:
-                "          \"type\" : \"half_float\"\n" +               // type: half_float (FLOAT4)
+                "          \"type\" : \"half_float\"\n" +               // type: half_float (FLOAT8)
                 "        },\n" +
                 "        \"myinteger\" : {\n" +                         // myinteger:
                 "          \"type\" : \"integer\"\n" +                  // type: integer (INT)
@@ -350,15 +379,15 @@ public class ElasticsearchMetadataHandlerTest
         LinkedHashMap<String, Object> index = (LinkedHashMap<String, Object>) mapping.get("mishmash");
         LinkedHashMap<String, Object> mappings = (LinkedHashMap<String, Object>) index.get("mappings");
 
-        when(mockClient.getMapping(anyString())).thenReturn(mappings);
+        when(mockClient.getMapping(nullable(String.class))).thenReturn(mappings);
 
         // Get real mapping.
         when(domainMapProvider.getDomainMap(null)).thenReturn(ImmutableMap.of("movies",
                 "https://search-movies-ne3fcqzfipy6jcrew2wca6kyqu.us-east-1.es.amazonaws.com"));
         handler = new ElasticsearchMetadataHandler(awsGlue, new LocalKeyFactory(), awsSecretsManager, amazonAthena,
-                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory,10);
+                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory, 10, ImmutableMap.of());
         GetTableRequest req = new GetTableRequest(fakeIdentity(), "queryId", "elasticsearch",
-                new TableName("movies", "mishmash"));
+                new TableName("movies", "mishmash"), Collections.emptyMap());
         GetTableResponse res = handler.doGetTable(allocator, req);
         Schema realMapping = res.getSchema();
 
@@ -383,6 +412,7 @@ public class ElasticsearchMetadataHandlerTest
         logger.info("doGetSplits: enter");
 
         List<String> partitionCols = new ArrayList<>();
+        String index = "customer";
 
         Block partitions = BlockUtils.newBlock(allocator, "partitionId", Types.MinorType.INT.getType(), 0);
 
@@ -390,10 +420,10 @@ public class ElasticsearchMetadataHandlerTest
         GetSplitsRequest originalReq = new GetSplitsRequest(fakeIdentity(),
                 "queryId",
                 "elasticsearch",
-                new TableName("movies", "customer"),
+                new TableName("movies", index),
                 partitions,
                 partitionCols,
-                new Constraints(new HashMap<>()),
+                new Constraints(Collections.emptyMap(), Collections.emptyList(), Collections.emptyList(), DEFAULT_NO_LIMIT, Collections.emptyMap()),
                 null);
 
         GetSplitsRequest req = new GetSplitsRequest(originalReq, continuationToken);
@@ -405,12 +435,18 @@ public class ElasticsearchMetadataHandlerTest
         String endpoint = "https://search-movies-ne3fcqzfipy6jcrew2wca6kyqu.us-east-1.es.amazonaws.com";
         when(domainMapProvider.getDomainMap(null)).thenReturn(ImmutableMap.of(domain, endpoint));
 
-        when(mockClient.getShardIds(anyString(), anyLong())).thenReturn(ImmutableSet
+        when(mockClient.getShardIds(nullable(String.class), anyLong())).thenReturn(ImmutableSet
                 .of(new Integer(0), new Integer(1), new Integer(2)));
+
+        IndicesClient indices = mock(IndicesClient.class);
+        GetIndexResponse mockIndexResponse = mock(GetIndexResponse.class);
+        when(mockIndexResponse.getIndices()).thenReturn(new String[]{index});
+        when(indices.get(nullable(GetIndexRequest.class), eq(RequestOptions.DEFAULT))).thenReturn(mockIndexResponse);
+        when(mockClient.indices()).thenReturn(indices);
 
         // Instantiate handler
         handler = new ElasticsearchMetadataHandler(awsGlue, new LocalKeyFactory(), awsSecretsManager, amazonAthena,
-                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory, 10);
+                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory, 10, ImmutableMap.of());
 
         // Call doGetSplits()
         MetadataResponse rawResponse = handler.doGetSplits(allocator, req);
@@ -433,6 +469,8 @@ public class ElasticsearchMetadataHandlerTest
             assertEquals(endpoint, split.getProperty(domain));
             String shard = split.getProperty(ElasticsearchMetadataHandler.SHARD_KEY);
             assertTrue("Split contains invalid shard: " + shard, shardIds.contains(shard));
+            String actualIndex = split.getProperty(ElasticsearchMetadataHandler.INDEX_KEY);
+            assertEquals("Split contains invalid index:" + index, index, actualIndex);
             shardIds.remove(shard);
         });
 
@@ -455,7 +493,7 @@ public class ElasticsearchMetadataHandlerTest
         logger.info("convertFieldTest: enter");
 
         handler = new ElasticsearchMetadataHandler(awsGlue, new LocalKeyFactory(), awsSecretsManager, amazonAthena,
-                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory, 10);
+                "spill-bucket", "spill-prefix", domainMapProvider, clientFactory, 10, ImmutableMap.of());
 
         Field field = handler.convertField("myscaled", "SCALED_FLOAT(10.51)");
 

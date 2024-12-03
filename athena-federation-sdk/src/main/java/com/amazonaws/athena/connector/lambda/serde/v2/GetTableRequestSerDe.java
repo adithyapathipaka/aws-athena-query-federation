@@ -31,6 +31,7 @@ import com.fasterxml.jackson.databind.DeserializationContext;
 import com.fasterxml.jackson.databind.SerializerProvider;
 
 import java.io.IOException;
+import java.util.Collections;
 
 import static java.util.Objects.requireNonNull;
 
@@ -38,7 +39,7 @@ public final class GetTableRequestSerDe
 {
     private static final String TABLE_NAME_FIELD = "tableName";
 
-    private GetTableRequestSerDe(){}
+    private GetTableRequestSerDe() {}
 
     public static final class Serializer extends MetadataRequestSerializer
     {
@@ -82,7 +83,7 @@ public final class GetTableRequestSerDe
             assertFieldName(jparser, TABLE_NAME_FIELD);
             TableName tableName = tableNameDeserializer.deserialize(jparser, ctxt);
 
-            return new GetTableRequest(identity, queryId, catalogName, tableName);
+            return new GetTableRequest(identity, queryId, catalogName, tableName, Collections.emptyMap());
         }
     }
 }

@@ -21,18 +21,9 @@ package com.amazonaws.athena.connectors.msk;
 
 public class AmazonMskConstants
 {
-    public static final String KAFKA_SOURCE = "kafka";
+    public static final String MSK_SOURCE = "msk";
     /**
-     * schema is set to default
-     */
-    public static final String KAFKA_SCHEMA = "default";
-    /**
-     * This is the glue registry ARN that user need to provide while deploying lambda.
-     * This glue registry will contain the mapping schemas
-     */
-    public static final String GLUE_REGISTRY_ARN = "glue_registry_arn";
-    /**
-     * For TLS authentication, user need to give S3 bucket reference where the client truststore and keystore
+     * For SSL authentication, user need to give S3 bucket reference where the client truststore and keystore
      * files are uploaded.
      */
     public static final String CERTIFICATES_S3_REFERENCE = "certificates_s3_reference";
@@ -72,6 +63,9 @@ public class AmazonMskConstants
     public static final String AWS_SECRET_PWD = "password";
 
     public static final int MAX_RECORDS_IN_SPLIT = 10_000;
+
+    public static final String AVRO_DATA_FORMAT = "avro";
+    public static final String PROTOBUF_DATA_FORMAT = "protobuf";
 
     private AmazonMskConstants()
     {

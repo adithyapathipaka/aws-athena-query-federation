@@ -28,22 +28,29 @@ import com.amazonaws.athena.connector.lambda.data.SchemaBuilder;
 import com.amazonaws.athena.connector.lambda.data.SupportedTypes;
 import com.amazonaws.athena.connector.lambda.domain.Split;
 import com.amazonaws.athena.connector.lambda.domain.TableName;
+import com.amazonaws.athena.connector.lambda.domain.predicate.functions.StandardFunctions;
 import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocation;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesRequest;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableLayoutRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableResponse;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.DataSourceOptimizations;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.OptimizationSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.ComplexExpressionPushdownSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.FilterPushdownSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.TopNPushdownSubType;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionConfig;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionInfo;
 import com.amazonaws.athena.connectors.jdbc.connection.JdbcConnectionFactory;
 import com.amazonaws.athena.connectors.jdbc.manager.JDBCUtil;
 import com.amazonaws.athena.connectors.jdbc.manager.JdbcArrowTypeConverter;
 import com.amazonaws.athena.connectors.jdbc.manager.JdbcMetadataHandler;
-import com.amazonaws.services.athena.AmazonAthena;
-import com.amazonaws.services.secretsmanager.AWSSecretsManager;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -54,19 +61,25 @@ import org.slf4j.LoggerFactory;
 import org.stringtemplate.v4.ST;
 import org.stringtemplate.v4.STGroup;
 import org.stringtemplate.v4.STGroupDir;
+import software.amazon.awssdk.services.athena.AthenaClient;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+
+import static com.amazonaws.athena.connector.lambda.domain.predicate.functions.StandardFunctions.IS_DISTINCT_FROM_OPERATOR_FUNCTION_NAME;
 
 public class SynapseMetadataHandler extends JdbcMetadataHandler
 {
@@ -81,25 +94,53 @@ public class SynapseMetadataHandler extends JdbcMetadataHandler
 
     private static final int MAX_SPLITS_PER_REQUEST = 1000_000;
 
-    public SynapseMetadataHandler()
+    public SynapseMetadataHandler(java.util.Map<String, String> configOptions)
     {
-        this(JDBCUtil.getSingleDatabaseConfigFromEnv(SynapseConstants.NAME));
+        this(JDBCUtil.getSingleDatabaseConfigFromEnv(SynapseConstants.NAME, configOptions), configOptions);
     }
 
     /**
      * Used by Mux.
      */
-    public SynapseMetadataHandler(final DatabaseConnectionConfig databaseConnectionConfig)
+    public SynapseMetadataHandler(DatabaseConnectionConfig databaseConnectionConfig, java.util.Map<String, String> configOptions)
     {
         super(databaseConnectionConfig, new SynapseJdbcConnectionFactory(databaseConnectionConfig, JDBC_PROPERTIES,
-                new DatabaseConnectionInfo(SynapseConstants.DRIVER_CLASS, SynapseConstants.DEFAULT_PORT)));
+                new DatabaseConnectionInfo(SynapseConstants.DRIVER_CLASS, SynapseConstants.DEFAULT_PORT)), configOptions);
     }
 
     @VisibleForTesting
-    protected SynapseMetadataHandler(final DatabaseConnectionConfig databaseConnectionConfig, final AWSSecretsManager secretsManager,
-                                     AmazonAthena athena, final JdbcConnectionFactory jdbcConnectionFactory)
+    protected SynapseMetadataHandler(
+        DatabaseConnectionConfig databaseConnectionConfig,
+        SecretsManagerClient secretsManager,
+        AthenaClient athena,
+        JdbcConnectionFactory jdbcConnectionFactory,
+        java.util.Map<String, String> configOptions)
     {
-        super(databaseConnectionConfig, secretsManager, athena, jdbcConnectionFactory);
+        super(databaseConnectionConfig, secretsManager, athena, jdbcConnectionFactory, configOptions);
+    }
+
+    @Override
+    public GetDataSourceCapabilitiesResponse doGetDataSourceCapabilities(BlockAllocator allocator, GetDataSourceCapabilitiesRequest request)
+    {
+        Set<StandardFunctions> unSupportedFunctions = ImmutableSet.of(IS_DISTINCT_FROM_OPERATOR_FUNCTION_NAME);
+        ImmutableMap.Builder<String, List<OptimizationSubType>> capabilities = ImmutableMap.builder();
+
+        capabilities.put(DataSourceOptimizations.SUPPORTS_FILTER_PUSHDOWN.withSupportedSubTypes(
+                FilterPushdownSubType.SORTED_RANGE_SET, FilterPushdownSubType.NULLABLE_COMPARISON
+        ));
+        capabilities.put(DataSourceOptimizations.SUPPORTS_COMPLEX_EXPRESSION_PUSHDOWN.withSupportedSubTypes(
+                ComplexExpressionPushdownSubType.SUPPORTED_FUNCTION_EXPRESSION_TYPES
+                        .withSubTypeProperties(Arrays.stream(StandardFunctions.values())
+                                .filter(values -> !unSupportedFunctions.contains(values))
+                                .map(standardFunctions -> standardFunctions.getFunctionName().getFunctionName())
+                                .toArray(String[]::new))
+        ));
+        capabilities.put(DataSourceOptimizations.SUPPORTS_TOP_N_PUSHDOWN.withSupportedSubTypes(
+                TopNPushdownSubType.SUPPORTS_ORDER_BY
+        ));
+
+        jdbcQueryPassthrough.addQueryPassthroughCapabilityIfEnabled(capabilities, configOptions);
+        return new GetDataSourceCapabilitiesResponse(request.getCatalogName(), capabilities.build());
     }
 
     @Override
@@ -215,6 +256,10 @@ public class SynapseMetadataHandler extends JdbcMetadataHandler
     public GetSplitsResponse doGetSplits(BlockAllocator blockAllocator, GetSplitsRequest getSplitsRequest)
     {
         LOGGER.info("{}: Catalog {}, table {}", getSplitsRequest.getQueryId(), getSplitsRequest.getTableName().getSchemaName(), getSplitsRequest.getTableName().getTableName());
+        if (getSplitsRequest.getConstraints().isQueryPassThrough()) {
+            LOGGER.info("QPT Split Requested");
+            return setupQueryPassthroughSplit(getSplitsRequest);
+        }
 
         int partitionContd = decodeContinuationToken(getSplitsRequest);
         Set<Split> splits = new HashSet<>();
@@ -281,6 +326,18 @@ public class SynapseMetadataHandler extends JdbcMetadataHandler
         }
     }
 
+    @Override
+    protected ArrowType convertDatasourceTypeToArrow(int columnIndex, int precision, Map<String, String> configOptions, ResultSetMetaData metadata) throws SQLException
+    {
+        String dataType = metadata.getColumnTypeName(columnIndex);
+        LOGGER.info("In convertDatasourceTypeToArrow: converting {}", dataType);
+        if (dataType != null && SynapseDataType.isSupported(dataType)) {
+            LOGGER.debug("Synapse  Datatype is support: {}", dataType);
+            return SynapseDataType.fromType(dataType); 
+        }
+        return super.convertDatasourceTypeToArrow(columnIndex, precision, configOptions, metadata);
+    }
+
     /**
      * Appropriate datatype to arrow type conversions will be done by fetching data types of columns
      * @param jdbcConnection
@@ -310,7 +367,7 @@ public class SynapseMetadataHandler extends JdbcMetadataHandler
             stmt.setString(1, tableName.getSchemaName() + "." + tableName.getTableName());
             try (ResultSet dataTypeResultSet = stmt.executeQuery()) {
                 while (dataTypeResultSet.next()) {
-                    List<String> columnDetails = List.of(
+                    List<String> columnDetails = com.google.common.collect.ImmutableList.of(
                             dataTypeResultSet.getString("DATA_TYPE").trim(),
                             dataTypeResultSet.getString("PRECISION").trim(),
                             dataTypeResultSet.getString("SCALE").trim());
@@ -319,10 +376,10 @@ public class SynapseMetadataHandler extends JdbcMetadataHandler
             }
         }
 
-        if ("azureServerless".equalsIgnoreCase(SynapseUtil.checkEnvironment(jdbcConnection.getMetaData().getURL()))) {
+        if (SynapseConstants.SQL_POOL.equalsIgnoreCase(SynapseUtil.checkEnvironment(jdbcConnection.getMetaData().getURL()))) {
             // getColumns() method from SQL Server driver is causing an exception in case of Azure Serverless environment.
             // so doing explicit data type conversion
-            schemaBuilder = doDataTypeConversion(columnNameAndDataTypeMap, tableName.getSchemaName());
+            schemaBuilder = doDataTypeConversion(columnNameAndDataTypeMap);
         }
         else {
             schemaBuilder = doDataTypeConversionForNonCompatible(jdbcConnection, tableName, columnNameAndDataTypeMap);
@@ -332,7 +389,7 @@ public class SynapseMetadataHandler extends JdbcMetadataHandler
         return schemaBuilder.build();
     }
 
-    private SchemaBuilder doDataTypeConversion(HashMap<String, List<String>> columnNameAndDataTypeMap, String schemaName)
+    private SchemaBuilder doDataTypeConversion(HashMap<String, List<String>> columnNameAndDataTypeMap)
     {
         SchemaBuilder schemaBuilder = SchemaBuilder.newBuilder();
 
@@ -404,55 +461,22 @@ public class SynapseMetadataHandler extends JdbcMetadataHandler
                 ArrowType columnType = JdbcArrowTypeConverter.toArrowType(
                         resultSet.getInt("DATA_TYPE"),
                         resultSet.getInt("COLUMN_SIZE"),
-                        resultSet.getInt("DECIMAL_DIGITS"));
+                        resultSet.getInt("DECIMAL_DIGITS"),
+                        configOptions);
                 String columnName = resultSet.getString("COLUMN_NAME");
                 String dataType = columnNameAndDataTypeMap.get(columnName).get(0);
 
                 LOGGER.debug("columnName: " + columnName);
                 LOGGER.debug("dataType: " + dataType);
 
-                /**
-                 * Converting date data type into DATEDAY since framework is unable to do it by default
-                 */
-                if ("date".equalsIgnoreCase(dataType)) {
-                    columnType = Types.MinorType.DATEDAY.getType();
+                if (dataType != null && SynapseDataType.isSupported(dataType)) {
+                    columnType = SynapseDataType.fromType(dataType);
                 }
-                /**
-                 * Converting bit data type into TINYINT because BIT type is showing 0 as false and 1 as true.
-                 * we can avoid it by changing to TINYINT.
-                 */
-                if ("bit".equalsIgnoreCase(dataType)) {
-                    columnType = Types.MinorType.TINYINT.getType();
-                }
-                /**
-                 * Converting tinyint data type into SMALLINT.
-                 * TINYINT range is 0 to 255 in SQL Server, usage of TINYINT(ArrowType) leads to data loss
-                 * as its using 1 bit as signed flag.
-                 */
-                if ("tinyint".equalsIgnoreCase(dataType)) {
-                    columnType = Types.MinorType.SMALLINT.getType();
-                }
-                /**
-                 * Converting numeric, smallmoney data types into FLOAT8 to avoid data loss
-                 * (ex: 123.45 is shown as 123 (loosing its scale))
-                 */
-                if ("numeric".equalsIgnoreCase(dataType) || "smallmoney".equalsIgnoreCase(dataType)) {
-                    columnType = Types.MinorType.FLOAT8.getType();
-                }
-                /**
-                 * Converting time data type(s) into DATEMILLI since framework is unable to map it by default
-                 */
-                if ("datetime".equalsIgnoreCase(dataType) || "datetime2".equalsIgnoreCase(dataType)
-                        || "smalldatetime".equalsIgnoreCase(dataType) || "datetimeoffset".equalsIgnoreCase(dataType)) {
-                    columnType = Types.MinorType.DATEMILLI.getType();
-                }
+
                 /**
                  * converting into VARCHAR for non supported data types.
                  */
-                if (columnType == null) {
-                    columnType = Types.MinorType.VARCHAR.getType();
-                }
-                if (columnType != null && !SupportedTypes.isSupported(columnType)) {
+                if ((columnType == null) || !SupportedTypes.isSupported(columnType)) {
                     columnType = Types.MinorType.VARCHAR.getType();
                 }
 

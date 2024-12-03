@@ -32,7 +32,7 @@ import org.slf4j.LoggerFactory;
 import java.sql.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.mockito.Matchers.anyString;
+import static org.mockito.ArgumentMatchers.nullable;
 
 public class VerticaSchemaUtilsTest extends TestBase
 {
@@ -47,10 +47,8 @@ public class VerticaSchemaUtilsTest extends TestBase
     {
         this.connection = Mockito.mock(Connection.class, Mockito.RETURNS_DEEP_STUBS);
         this.databaseMetaData = Mockito.mock(DatabaseMetaData.class);
-        VerticaConnectionFactory verticaConnectionFactory = Mockito.mock(VerticaConnectionFactory.class);
         this.tableName = Mockito.mock(TableName.class);
 
-        Mockito.when(verticaConnectionFactory.getOrCreateConn(anyString())).thenReturn(connection);
         Mockito.when(connection.getMetaData()).thenReturn(databaseMetaData);
     }
 

@@ -95,13 +95,32 @@ public class CompositeHandler
             throws IOException
     {
         try (BlockAllocatorImpl allocator = new BlockAllocatorImpl()) {
-            ObjectMapper objectMapper = VersionedObjectMapperFactory.create(allocator);
-            try (FederationRequest rawReq = objectMapper.readValue(inputStream, FederationRequest.class)) {
-                if (rawReq instanceof MetadataRequest) {
-                    ((MetadataRequest) rawReq).setContext(context);
+            int resolvedSerDeVersion = SerDeVersion.SERDE_VERSION;
+            byte[] allInputBytes = com.google.common.io.ByteStreams.toByteArray(inputStream);
+            FederationRequest rawReq = null;
+            ObjectMapper objectMapper = null;
+            while (resolvedSerDeVersion >= 1) {
+                try {
+                    objectMapper = VersionedObjectMapperFactory.create(allocator, resolvedSerDeVersion);
+                    rawReq = objectMapper.readValue(allInputBytes, FederationRequest.class);
+                    break;
                 }
-                handleRequest(allocator, rawReq, outputStream, objectMapper);
+                catch (IllegalStateException e) { // if client has not upgraded to our latest, fallback to lower version
+                    logger.warn("Client's SerDe mis-matched with connector version:, attempt with lower version: '{}'", --resolvedSerDeVersion, e);
+                }
             }
+
+            if (rawReq == null || objectMapper == null) {
+                throw new RuntimeException(String.format("FederationRequest/ObjectMapper is null with SerDeVersion: '%d'", resolvedSerDeVersion));
+            }
+
+            logger.info("Parsing request with resolvedSerDeVersion: '{}', connector SerDeVersion: '{}'", resolvedSerDeVersion, SerDeVersion.SERDE_VERSION);
+
+            if (rawReq instanceof MetadataRequest) {
+                ((MetadataRequest) rawReq).setContext(context);
+            }
+            handleRequest(allocator, rawReq, outputStream, objectMapper);
+            rawReq.close();
         }
         catch (Exception ex) {
             logger.warn("handleRequest: Completed with an exception.", ex);

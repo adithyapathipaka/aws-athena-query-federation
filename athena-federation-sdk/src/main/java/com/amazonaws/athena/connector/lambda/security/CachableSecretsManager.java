@@ -20,12 +20,12 @@ package com.amazonaws.athena.connector.lambda.security;
  * #L%
  */
 
-import com.amazonaws.services.secretsmanager.AWSSecretsManager;
-import com.amazonaws.services.secretsmanager.model.GetSecretValueRequest;
-import com.amazonaws.services.secretsmanager.model.GetSecretValueResult;
 import org.apache.arrow.util.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
+import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueRequest;
+import software.amazon.awssdk.services.secretsmanager.model.GetSecretValueResponse;
 
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -46,15 +46,15 @@ public class CachableSecretsManager
     private static final long MAX_CACHE_AGE_MS = 60_000;
     protected static final int MAX_CACHE_SIZE = 10;
 
-    private static final String SECRET_PATTERN = "(\\$\\{[a-zA-Z0-9-_\\-]+\\})";
-    private static final String SECRET_NAME_PATTERN = "\\$\\{([a-zA-Z0-9-_\\-]+)\\}";
+    private static final String SECRET_PATTERN = "(\\$\\{[a-zA-Z0-9-\\/_\\-\\.\\+=@]+\\})";
+    private static final String SECRET_NAME_PATTERN = "\\$\\{([a-zA-Z0-9-\\/_\\-\\.\\+=@]+)\\}";
     private static final Pattern PATTERN = Pattern.compile(SECRET_PATTERN);
     private static final Pattern NAME_PATTERN = Pattern.compile(SECRET_NAME_PATTERN);
 
     private final LinkedHashMap<String, CacheEntry> cache = new LinkedHashMap<>();
-    private final AWSSecretsManager secretsManager;
+    private final SecretsManagerClient secretsManager;
 
-    public CachableSecretsManager(AWSSecretsManager secretsManager)
+    public CachableSecretsManager(SecretsManagerClient secretsManager)
     {
         this.secretsManager = secretsManager;
     }
@@ -97,9 +97,10 @@ public class CachableSecretsManager
 
         if (cacheEntry == null || cacheEntry.getAge() > MAX_CACHE_AGE_MS) {
             logger.info("getSecret: Resolving secret[{}].", secretName);
-            GetSecretValueResult secretValueResult = secretsManager.getSecretValue(new GetSecretValueRequest()
-                    .withSecretId(secretName));
-            cacheEntry = new CacheEntry(secretName, secretValueResult.getSecretString());
+            GetSecretValueResponse secretValueResult = secretsManager.getSecretValue(GetSecretValueRequest.builder()
+                    .secretId(secretName)
+                    .build());
+            cacheEntry = new CacheEntry(secretName, secretValueResult.secretString());
             evictCache(cache.size() >= MAX_CACHE_SIZE);
             cache.put(secretName, cacheEntry);
         }

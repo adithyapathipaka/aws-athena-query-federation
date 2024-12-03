@@ -34,6 +34,8 @@ import com.amazonaws.athena.connector.lambda.domain.predicate.ConstraintEvaluato
 import com.amazonaws.athena.connector.lambda.domain.spill.S3SpillLocation;
 import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocation;
 import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocationVerifier;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesRequest;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableLayoutRequest;
@@ -56,24 +58,23 @@ import com.amazonaws.athena.connector.lambda.security.EncryptionKeyFactory;
 import com.amazonaws.athena.connector.lambda.security.KmsKeyFactory;
 import com.amazonaws.athena.connector.lambda.security.LocalKeyFactory;
 import com.amazonaws.athena.connector.lambda.serde.VersionedObjectMapperFactory;
-import com.amazonaws.services.athena.AmazonAthena;
-import com.amazonaws.services.athena.AmazonAthenaClientBuilder;
-import com.amazonaws.services.kms.AWSKMSClientBuilder;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestStreamHandler;
-import com.amazonaws.services.s3.AmazonS3ClientBuilder;
-import com.amazonaws.services.secretsmanager.AWSSecretsManager;
-import com.amazonaws.services.secretsmanager.AWSSecretsManagerClientBuilder;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.athena.AthenaClient;
+import software.amazon.awssdk.services.kms.KmsClient;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Collections;
 import java.util.UUID;
 
 import static com.amazonaws.athena.connector.lambda.handlers.AthenaExceptionFilter.ATHENA_EXCEPTION_FILTER;
@@ -96,6 +97,12 @@ public abstract class MetadataHandler
         implements RequestStreamHandler
 {
     private static final Logger logger = LoggerFactory.getLogger(MetadataHandler.class);
+
+    // When MetadataHandler is used as a Lambda, configOptions is the same as System.getenv()
+    // Otherwise in situations where the connector is used outside of a Lambda, it may be a config map
+    // that is passed in.
+    protected final java.util.Map<String, String> configOptions;
+
     //name of the default column used when a default single-partition response is required for connectors that
     //do not support robust partitioning. In such cases Athena requires at least 1 partition in order indicate
     //there is indeed data to be read vs. queries that were able to fully partition prune and thus decide there
@@ -109,10 +116,9 @@ public abstract class MetadataHandler
     protected static final String SPILL_PREFIX_ENV = "spill_prefix";
     protected static final String KMS_KEY_ID_ENV = "kms_key_id";
     protected static final String DISABLE_SPILL_ENCRYPTION = "disable_spill_encryption";
-
     private final CachableSecretsManager secretsManager;
-    private final AmazonAthena athena;
-    private final ThrottlingInvoker athenaInvoker = ThrottlingInvoker.newDefaultBuilder(ATHENA_EXCEPTION_FILTER).build();
+    private final AthenaClient athena;
+    private final ThrottlingInvoker athenaInvoker;
     private final EncryptionKeyFactory encryptionKeyFactory;
     private final String spillBucket;
     private final String spillPrefix;
@@ -120,46 +126,56 @@ public abstract class MetadataHandler
     private final SpillLocationVerifier verifier;
 
     /**
+     * When MetadataHandler is used as a Lambda, the "Main" class will pass in System.getenv() as the configOptions.
+     * Otherwise in situations where the connector is used outside of a Lambda, it may be a config map
+     * that is passed in.
      * @param sourceType Used to aid in logging diagnostic info when raising a support case.
      */
-    public MetadataHandler(String sourceType)
+    public MetadataHandler(String sourceType, java.util.Map<String, String> configOptions)
     {
+        this.configOptions = configOptions;
         this.sourceType = sourceType;
-        this.spillBucket = System.getenv(SPILL_BUCKET_ENV);
-        this.spillPrefix = System.getenv(SPILL_PREFIX_ENV) == null ?
-                DEFAULT_SPILL_PREFIX : System.getenv(SPILL_PREFIX_ENV);
-        if (System.getenv(DISABLE_SPILL_ENCRYPTION) == null ||
-                !DISABLE_ENCRYPTION.equalsIgnoreCase(System.getenv(DISABLE_SPILL_ENCRYPTION))) {
-            encryptionKeyFactory = (System.getenv(KMS_KEY_ID_ENV) != null) ?
-                    new KmsKeyFactory(AWSKMSClientBuilder.standard().build(), System.getenv(KMS_KEY_ID_ENV)) :
-                    new LocalKeyFactory();
+        this.spillBucket = this.configOptions.get(SPILL_BUCKET_ENV);
+        this.spillPrefix = this.configOptions.getOrDefault(SPILL_PREFIX_ENV, DEFAULT_SPILL_PREFIX);
+
+        if (DISABLE_ENCRYPTION.equalsIgnoreCase(this.configOptions.getOrDefault(DISABLE_SPILL_ENCRYPTION, "false"))) {
+            logger.debug("DISABLE_SPILL_ENCRYPTION");
+            this.encryptionKeyFactory = null;
         }
         else {
-            encryptionKeyFactory = null;
+            this.encryptionKeyFactory = (this.configOptions.get(KMS_KEY_ID_ENV) != null) ?
+                    new KmsKeyFactory(KmsClient.create(), this.configOptions.get(KMS_KEY_ID_ENV)) :
+                    new LocalKeyFactory();
+            logger.debug("ENABLE_SPILL_ENCRYPTION with encryption factory: " + encryptionKeyFactory.getClass().getSimpleName());
         }
 
-        this.secretsManager = new CachableSecretsManager(AWSSecretsManagerClientBuilder.defaultClient());
-        this.athena = AmazonAthenaClientBuilder.defaultClient();
-        this.verifier = new SpillLocationVerifier(AmazonS3ClientBuilder.standard().build());
+        this.secretsManager = new CachableSecretsManager(SecretsManagerClient.create());
+        this.athena = AthenaClient.create();
+        this.verifier = new SpillLocationVerifier(S3Client.create());
+        this.athenaInvoker = ThrottlingInvoker.newDefaultBuilder(ATHENA_EXCEPTION_FILTER, configOptions).build();
     }
 
     /**
      * @param sourceType Used to aid in logging diagnostic info when raising a support case.
      */
-    public MetadataHandler(EncryptionKeyFactory encryptionKeyFactory,
-            AWSSecretsManager secretsManager,
-            AmazonAthena athena,
-            String sourceType,
-            String spillBucket,
-            String spillPrefix)
+    public MetadataHandler(
+        EncryptionKeyFactory encryptionKeyFactory,
+        SecretsManagerClient secretsManager,
+        AthenaClient athena,
+        String sourceType,
+        String spillBucket,
+        String spillPrefix,
+        java.util.Map<String, String> configOptions)
     {
+        this.configOptions = configOptions;
         this.encryptionKeyFactory = encryptionKeyFactory;
         this.secretsManager = new CachableSecretsManager(secretsManager);
         this.athena = athena;
         this.sourceType = sourceType;
         this.spillBucket = spillBucket;
         this.spillPrefix = spillPrefix;
-        this.verifier = new SpillLocationVerifier(AmazonS3ClientBuilder.standard().build());
+        this.verifier = new SpillLocationVerifier(S3Client.create());
+        this.athenaInvoker = ThrottlingInvoker.newDefaultBuilder(ATHENA_EXCEPTION_FILTER, configOptions).build();
     }
 
     /**
@@ -254,7 +270,7 @@ public abstract class MetadataHandler
                 }
                 return;
             case GET_TABLE:
-                try (GetTableResponse response = doGetTable(allocator, (GetTableRequest) req)) {
+                try (GetTableResponse response = resolveDoGetTableImplementation(allocator, (GetTableRequest) req)) {
                     logger.info("doHandleRequest: response[{}]", response);
                     assertNotNull(response);
                     assertTypes(response);
@@ -271,6 +287,13 @@ public abstract class MetadataHandler
             case GET_SPLITS:
                 verifier.checkBucketAuthZ(spillBucket);
                 try (GetSplitsResponse response = doGetSplits(allocator, (GetSplitsRequest) req)) {
+                    logger.info("doHandleRequest: response[{}]", response);
+                    assertNotNull(response);
+                    objectMapper.writeValue(outputStream, response);
+                }
+                return;
+            case GET_DATASOURCE_CAPABILITIES:
+                try (GetDataSourceCapabilitiesResponse response = doGetDataSourceCapabilities(allocator, (GetDataSourceCapabilitiesRequest) req)) {
                     logger.info("doHandleRequest: response[{}]", response);
                     assertNotNull(response);
                     objectMapper.writeValue(outputStream, response);
@@ -302,6 +325,32 @@ public abstract class MetadataHandler
      */
     public abstract ListTablesResponse doListTables(final BlockAllocator allocator, final ListTablesRequest request)
             throws Exception;
+
+    private GetTableResponse resolveDoGetTableImplementation(final BlockAllocator allocator, final GetTableRequest request)
+            throws Exception
+    {
+        logger.info("resolveDoGetTableImplementation: resolving implementation - isQueryPassthrough[{}]", request.isQueryPassthrough());
+        if (request.isQueryPassthrough()) {
+            return doGetQueryPassthroughSchema(allocator, request);
+        }
+        return doGetTable(allocator, request);
+    }
+
+    /**
+     * Used to get definition (field names, types, descriptions, etc...) of a Query PassThrough.
+     *
+     * @param allocator Tool for creating and managing Apache Arrow Blocks.
+     * @param request Provides details on who made the request and which Athena catalog, database, and table they are querying.
+     * @return A GetTableResponse which primarily contains:
+     * 1. An Apache Arrow Schema object describing the table's columns, types, and descriptions.
+     * 2. A Set<String> of partition column names (or empty if the table isn't partitioned).
+     */
+    public GetTableResponse doGetQueryPassthroughSchema(final BlockAllocator allocator, final GetTableRequest request)
+            throws Exception
+    {
+        //todo; maybe we need a better name for this method,
+        throw new UnsupportedOperationException("Not implemented");
+    }
 
     /**
      * Used to get definition (field names, types, descriptions, etc...) of a Table.
@@ -429,6 +478,20 @@ public abstract class MetadataHandler
      */
     public abstract GetSplitsResponse doGetSplits(BlockAllocator allocator, GetSplitsRequest request)
             throws Exception;
+
+    /**
+     * Used to describe the types of capabilities supported by a data source. An engine can use this to determine what
+     * portions of the query to push down. A connector that returns any optimization will guarantee that the associated
+     * predicate will be pushed down.
+     * @param allocator Tool for creating and managing Apache Arrow Blocks.
+     * @param request Provides details about the catalog being used.
+     * @return A GetDataSourceCapabilitiesResponse object which returns a map of supported optimizations that
+     * the connector is advertising to the consumer. The connector assumes all responsibility for whatever is passed here.
+     */
+    public GetDataSourceCapabilitiesResponse doGetDataSourceCapabilities(BlockAllocator allocator, GetDataSourceCapabilitiesRequest request)
+    {
+        return new GetDataSourceCapabilitiesResponse(request.getCatalogName(), Collections.emptyMap());
+    }
 
     /**
      * Used to warm up your function as well as to discovery its capabilities (e.g. SDK capabilities)

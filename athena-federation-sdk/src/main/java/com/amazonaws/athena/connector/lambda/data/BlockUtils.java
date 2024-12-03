@@ -33,6 +33,7 @@ import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeStampMicroTZVector;
 import org.apache.arrow.vector.TimeStampMilliTZVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.UInt1Vector;
@@ -58,6 +59,7 @@ import org.apache.arrow.vector.complex.writer.Float4Writer;
 import org.apache.arrow.vector.complex.writer.Float8Writer;
 import org.apache.arrow.vector.complex.writer.IntWriter;
 import org.apache.arrow.vector.complex.writer.SmallIntWriter;
+import org.apache.arrow.vector.complex.writer.TimeStampMicroTZWriter;
 import org.apache.arrow.vector.complex.writer.TimeStampMilliTZWriter;
 import org.apache.arrow.vector.complex.writer.TinyIntWriter;
 import org.apache.arrow.vector.complex.writer.UInt1Writer;
@@ -72,7 +74,6 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.Text;
 import org.apache.commons.codec.Charsets;
-import org.joda.time.DateTimeZone;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -81,6 +82,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
@@ -239,35 +241,28 @@ public class BlockUtils
             }
             /**
              * We will convert any types that are not supported by setValue to types that are supported
-             * ex) (not supported) org.joda.time.LocalDateTime which is returned on read from vectors
+             * ex) (not supported) LocalDateTime which is returned on read from vectors
              * will be converted to (supported) java.time.ZonedDateTime
              */
 
             //TODO: add all types
             switch (vector.getMinorType()) {
                 case TIMESTAMPMILLITZ:
-                    if (value instanceof org.joda.time.LocalDateTime) {
-                        DateTimeZone dtz = ((org.joda.time.LocalDateTime) value).getChronology().getZone();
-                        long dateTimeWithZone = ((org.joda.time.LocalDateTime) value).toDateTime(dtz).getMillis();
-                        ((TimeStampMilliTZVector) vector).setSafe(pos, dateTimeWithZone);
-                    }
-                    if (value instanceof ZonedDateTime) {
-                        long dateTimeWithZone = DateTimeFormatterUtil.packDateTimeWithZone((ZonedDateTime) value);
-                        ((TimeStampMilliTZVector) vector).setSafe(pos, dateTimeWithZone);
-                    }
-                    else if (value instanceof LocalDateTime) {
-                        long dateTimeWithZone = DateTimeFormatterUtil.packDateTimeWithZone(
-                                ((LocalDateTime) value).atZone(UTC_ZONE_ID).toInstant().toEpochMilli(), UTC_ZONE_ID.getId());
-                        ((TimeStampMilliTZVector) vector).setSafe(pos, dateTimeWithZone);
-                    }
-                    else if (value instanceof Date) {
-                        long ldtInLong = Instant.ofEpochMilli(((Date) value).getTime())
-                                .atZone(UTC_ZONE_ID).toInstant().toEpochMilli();
-                        long dateTimeWithZone = DateTimeFormatterUtil.packDateTimeWithZone(ldtInLong, UTC_ZONE_ID.getId());
-                        ((TimeStampMilliTZVector) vector).setSafe(pos, dateTimeWithZone);
+                    if (value instanceof Long) {
+                        ((TimeStampMilliTZVector) vector).setSafe(pos, (long) value);
                     }
                     else {
-                        ((TimeStampMilliTZVector) vector).setSafe(pos, (long) value);
+                        String targetTimeZone = ((ArrowType.Timestamp) vector.getField().getType()).getTimezone();
+                        ((TimeStampMilliTZVector) vector).setSafe(pos, DateTimeFormatterUtil.timestampMilliTzHolderFromObject(value, targetTimeZone));
+                    }
+                    break;
+                case TIMESTAMPMICROTZ:
+                    if (value instanceof Long) {
+                        ((TimeStampMicroTZVector) vector).setSafe(pos, (long) value);
+                    }
+                    else {
+                        String targetTimeZone = ((ArrowType.Timestamp) vector.getField().getType()).getTimezone();
+                        ((TimeStampMicroTZVector) vector).setSafe(pos, DateTimeFormatterUtil.timestampMicroTzHolderFromObject(value, targetTimeZone));
                     }
                     break;
                 case DATEMILLI:
@@ -279,15 +274,17 @@ public class BlockUtils
                                 pos,
                                 ((LocalDateTime) value).atZone(UTC_ZONE_ID).toInstant().toEpochMilli());
                     }
+                    else if (value instanceof Instant) {
+                        ((DateMilliVector) vector).setSafe(pos, ((Instant) value).toEpochMilli());
+                    }
                     else {
                         ((DateMilliVector) vector).setSafe(pos, (long) value);
                     }
                     break;
                 case DATEDAY:
                     if (value instanceof Date) {
-                        org.joda.time.Days days = org.joda.time.Days.daysBetween(EPOCH,
-                                new org.joda.time.DateTime(((Date) value).getTime()));
-                        ((DateDayVector) vector).setSafe(pos, days.getDays());
+                        long days = java.time.Duration.of(((Date) value).getTime(), java.time.temporal.ChronoUnit.MILLIS).toDays();
+                        ((DateDayVector) vector).setSafe(pos, new Long(days).intValue());
                     }
                     else if (value instanceof LocalDate) {
                         int days = (int) ((LocalDate) value).toEpochDay();
@@ -455,9 +452,12 @@ public class BlockUtils
     {
         switch (reader.getMinorType()) {
             case DATEDAY:
-                return String.valueOf(reader.readInteger());
+                LocalDate localDate = LocalDate.ofEpochDay(reader.readInteger());
+                return localDate.format(DateTimeFormatter.ISO_DATE);
+            case TIMESTAMPMICROTZ:
             case TIMESTAMPMILLITZ:
-                return String.valueOf(DateTimeFormatterUtil.constructZonedDateTime(reader.readLong()));
+                ArrowType.Timestamp actualType = (ArrowType.Timestamp) reader.getField().getType();
+                return String.valueOf(DateTimeFormatterUtil.constructZonedDateTime(reader.readLong(), actualType));
             case DATEMILLI:
                 return String.valueOf(reader.readLocalDateTime());
             case FLOAT8:
@@ -783,33 +783,28 @@ public class BlockUtils
         ArrowType type = field.getType();
         try {
             switch (Types.getMinorTypeForArrowType(type)) {
-                case TIMESTAMPMILLITZ:
-                    long dateTimeWithZone;
+                case TIMESTAMPMILLITZ: {
                     String timezone =  ((ArrowType.Timestamp) type).getTimezone();
-
                     // Known issue with Lists and Maps of TimeStampMilliTZ. This will throw.
                     TimeStampMilliTZWriter timeStampMilliTZWriter = fromMapOrStruct ? writer.timeStampMilliTZ(field.getName(), timezone) : writer.timeStampMilliTZ();
                     if (value == null) {
                         timeStampMilliTZWriter.writeNull();
                         break;
                     }
-                    else if (value instanceof ZonedDateTime) {
-                        dateTimeWithZone = DateTimeFormatterUtil.packDateTimeWithZone((ZonedDateTime) value);
-                    }
-                    else if (value instanceof LocalDateTime) {
-                        dateTimeWithZone = DateTimeFormatterUtil.packDateTimeWithZone(
-                                ((LocalDateTime) value).atZone(UTC_ZONE_ID).toInstant().toEpochMilli(), UTC_ZONE_ID.getId());
-                    }
-                    else if (value instanceof Date) {
-                        long ldtInLong = Instant.ofEpochMilli(((Date) value).getTime())
-                                .atZone(UTC_ZONE_ID).toInstant().toEpochMilli();
-                        dateTimeWithZone = DateTimeFormatterUtil.packDateTimeWithZone(ldtInLong, UTC_ZONE_ID.getId());
-                    }
-                    else {
-                        dateTimeWithZone = (long) value;
-                    }
-                    timeStampMilliTZWriter.writeTimeStampMilliTZ(dateTimeWithZone);
+                    timeStampMilliTZWriter.write(DateTimeFormatterUtil.timestampMilliTzHolderFromObject(value, timezone));
                     break;
+                }
+                case TIMESTAMPMICROTZ: {
+                    String timezone = ((ArrowType.Timestamp) type).getTimezone();
+                    // Known issue with Lists and Maps of TimeStampMicroTZ. This will throw.
+                    TimeStampMicroTZWriter timeStampMicroTZWriter = fromMapOrStruct ? writer.timeStampMicroTZ(field.getName(), timezone) : writer.timeStampMicroTZ();
+                    if (value == null) {
+                        timeStampMicroTZWriter.writeNull();
+                        break;
+                    }
+                    timeStampMicroTZWriter.write(DateTimeFormatterUtil.timestampMicroTzHolderFromObject(value, timezone));
+                    break;
+                }
                 case DATEMILLI:
                     DateMilliWriter dateMilliWriter = fromMapOrStruct ? writer.dateMilli(field.getName()) : writer.dateMilli();
                     if (value == null) {
@@ -831,9 +826,8 @@ public class BlockUtils
                         dateDayWriter.writeNull();
                     }
                     else if (value instanceof Date) {
-                        org.joda.time.Days days = org.joda.time.Days.daysBetween(EPOCH,
-                                new org.joda.time.DateTime(((Date) value).getTime()));
-                        dateDayWriter.writeDateDay(days.getDays());
+                        long days = java.time.Duration.of(((Date) value).getTime(), java.time.temporal.ChronoUnit.MILLIS).toDays();
+                        dateDayWriter.writeDateDay(new Long(days).intValue());
                     }
                     else if (value instanceof LocalDate) {
                         int days = (int) ((LocalDate) value).toEpochDay();
@@ -1040,6 +1034,9 @@ public class BlockUtils
     private static void setNullValue(FieldVector vector, int pos)
     {
         switch (vector.getMinorType()) {
+            case TIMESTAMPMICROTZ:
+                ((TimeStampMicroTZVector) vector).setNull(pos);
+                break;
             case TIMESTAMPMILLITZ:
                 ((TimeStampMilliTZVector) vector).setNull(pos);
                 break;
@@ -1108,6 +1105,9 @@ public class BlockUtils
     {
         for (FieldVector vector : block.getFieldVectors()) {
             switch (vector.getMinorType()) {
+                case TIMESTAMPMICROTZ:
+                    ((TimeStampMicroTZVector) vector).setNull(row);
+                    break;
                 case TIMESTAMPMILLITZ:
                     ((TimeStampMilliTZVector) vector).setNull(row);
                     break;
@@ -1187,6 +1187,7 @@ public class BlockUtils
     public static Class getJavaType(Types.MinorType minorType)
     {
         switch (minorType) {
+            case TIMESTAMPMICROTZ:
             case TIMESTAMPMILLITZ:
                 return ZonedDateTime.class;
             case DATEMILLI:
@@ -1225,12 +1226,6 @@ public class BlockUtils
             default:
                 throw new IllegalArgumentException("Unknown type " + minorType);
         }
-    }
-
-    public static final org.joda.time.MutableDateTime EPOCH = new org.joda.time.MutableDateTime();
-
-    static {
-        EPOCH.setDate(0);
     }
 
     private BlockUtils() {}

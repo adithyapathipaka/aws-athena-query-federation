@@ -14,7 +14,7 @@ Metadata:
     SourceCodeUrl: 'https://github.com/awslabs/aws-athena-query-federation'
 Parameters:
   LambdaFunctionName:
-    Description: 'The name you will give to this catalog in Athena. It will also be used as the function name. This name must satisfy the pattern ^[a-z0-9-_]{1,64}$'
+    Description: 'This is the name of the lambda function that will be created. This name must satisfy the pattern ^[a-z0-9-_]{1,64}$'
     Type: String
     AllowedPattern: ^[a-z0-9-_]{1,64}$
   DefaultConnectionString:
@@ -48,6 +48,19 @@ Parameters:
   SubnetIds:
     Description: 'One or more Subnet IDs corresponding to the Subnet that the Lambda function can use to access you data source. (e.g. subnet1,subnet2)'
     Type: 'List<AWS::EC2::Subnet::Id>'
+  PermissionsBoundaryARN:
+    Description: "(Optional) An IAM policy ARN to use as the PermissionsBoundary for the created Lambda function's execution role"
+    Default: ''
+    Type: String
+  LambdaEncryptionKmsKeyARN:
+    Description: "(Optional) The KMS Key ARN used for encrypting your Lambda environment variables."
+    Default: ""
+    Type: String
+Conditions:
+  HasPermissionsBoundary: !Not [ !Equals [ !Ref PermissionsBoundaryARN, "" ] ]
+  HasLambdaEncryptionKmsKeyARN: !Not [ !Equals [ !Ref LambdaEncryptionKmsKeyARN, "" ] ]
+  IsRegionBAH: !Equals [!Ref "AWS::Region", "me-south-1"]
+  IsRegionHKG: !Equals [!Ref "AWS::Region", "ap-east-1"]
 Resources:
   JdbcConnectorConfig:
     Type: 'AWS::Serverless::Function'
@@ -59,12 +72,14 @@ Resources:
           spill_prefix: !Ref SpillPrefix
           default: !Ref DefaultConnectionString
       FunctionName: !Ref LambdaFunctionName
-      Handler: "com.amazonaws.athena.connectors.cloudera.ImpalaMuxCompositeHandler"
-      CodeUri: "./target/athena-cloudera-impala-2022.47.1.jar"
+      PackageType: "Image"
+      ImageUri: !Sub
+        - '${Account}.dkr.ecr.${AWS::Region}.amazonaws.com/athena-federation-repository-cloudera-impala:2022.47.1'
+        - Account: !If [IsRegionBAH, 084828588479, !If [IsRegionHKG, 183295418215, 292517598671]]
       Description: "Enables Amazon Athena to communicate with Cloudera Impala using JDBC"
-      Runtime: java11
       Timeout: !Ref LambdaTimeout
       MemorySize: !Ref LambdaMemory
+      PermissionsBoundary: !If [ HasPermissionsBoundary, !Ref PermissionsBoundaryARN, !Ref "AWS::NoValue" ]
       Policies:
         - Statement:
             - Action:
@@ -88,7 +103,6 @@ Resources:
         - Statement:
           - Action:
               - athena:GetQueryExecution
-              - s3:ListAllMyBuckets
             Effect: Allow
             Resource: '*'
           Version: '2012-10-17'
@@ -101,3 +115,4 @@ Resources:
       VpcConfig:
         SecurityGroupIds: !Ref SecurityGroupIds
         SubnetIds: !Ref SubnetIds
+      KmsKeyArn: !If [ HasLambdaEncryptionKmsKeyARN, !Ref LambdaEncryptionKmsKeyARN, !Ref "AWS::NoValue" ]

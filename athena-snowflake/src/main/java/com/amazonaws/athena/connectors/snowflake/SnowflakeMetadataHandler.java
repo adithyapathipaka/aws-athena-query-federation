@@ -30,7 +30,10 @@ import com.amazonaws.athena.connector.lambda.data.SchemaBuilder;
 import com.amazonaws.athena.connector.lambda.data.SupportedTypes;
 import com.amazonaws.athena.connector.lambda.domain.Split;
 import com.amazonaws.athena.connector.lambda.domain.TableName;
+import com.amazonaws.athena.connector.lambda.domain.predicate.functions.StandardFunctions;
 import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocation;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesRequest;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableLayoutRequest;
@@ -38,6 +41,12 @@ import com.amazonaws.athena.connector.lambda.metadata.GetTableRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableResponse;
 import com.amazonaws.athena.connector.lambda.metadata.ListSchemasRequest;
 import com.amazonaws.athena.connector.lambda.metadata.ListSchemasResponse;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.DataSourceOptimizations;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.OptimizationSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.ComplexExpressionPushdownSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.FilterPushdownSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.LimitPushdownSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.TopNPushdownSubType;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionConfig;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionInfo;
 import com.amazonaws.athena.connectors.jdbc.connection.GenericJdbcConnectionFactory;
@@ -46,9 +55,8 @@ import com.amazonaws.athena.connectors.jdbc.manager.JDBCUtil;
 import com.amazonaws.athena.connectors.jdbc.manager.JdbcArrowTypeConverter;
 import com.amazonaws.athena.connectors.jdbc.manager.JdbcMetadataHandler;
 import com.amazonaws.athena.connectors.jdbc.manager.PreparedStatementBuilder;
-import com.amazonaws.services.athena.AmazonAthena;
-import com.amazonaws.services.secretsmanager.AWSSecretsManager;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import org.apache.arrow.vector.complex.reader.FieldReader;
@@ -58,23 +66,26 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.athena.AthenaClient;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 import static com.amazonaws.athena.connectors.snowflake.SnowflakeConstants.MAX_PARTITION_COUNT;
-import static com.amazonaws.athena.connectors.snowflake.SnowflakeConstants.PARTITION_RECORD_COUNT;
-import static java.util.Map.entry;
+import static com.amazonaws.athena.connectors.snowflake.SnowflakeConstants.SINGLE_SPLIT_LIMIT_COUNT;
 
 /**
  * Handles metadata for Snowflake. User must have access to `schemata`, `tables`, `columns` in
@@ -95,6 +106,9 @@ public class SnowflakeMetadataHandler extends JdbcMetadataHandler
             "WHERE  table_type = 'BASE TABLE'\n" +
             "AND table_schema= ?\n" +
             "AND TABLE_NAME = ? ";
+    static final String SHOW_PRIMARY_KEYS_QUERY = "SHOW PRIMARY KEYS IN ";
+    static final String PRIMARY_KEY_COLUMN_NAME = "column_name";
+    static final String COUNTS_COLUMN_NAME = "COUNTS";
     private static final String CASE_UPPER = "upper";
     private static final String CASE_LOWER = "lower";
     /**
@@ -107,31 +121,60 @@ public class SnowflakeMetadataHandler extends JdbcMetadataHandler
      *
      * Recommend using {@link SnowflakeMuxCompositeHandler} instead.
      */
-    public SnowflakeMetadataHandler()
+    public SnowflakeMetadataHandler(java.util.Map<String, String> configOptions)
     {
-        this(JDBCUtil.getSingleDatabaseConfigFromEnv(SnowflakeConstants.SNOWFLAKE_NAME));
+        this(JDBCUtil.getSingleDatabaseConfigFromEnv(SnowflakeConstants.SNOWFLAKE_NAME, configOptions), configOptions);
     }
 
     /**
      * Used by Mux.
      */
-    public SnowflakeMetadataHandler(final DatabaseConnectionConfig databaseConnectionConfig)
+    public SnowflakeMetadataHandler(DatabaseConnectionConfig databaseConnectionConfig, java.util.Map<String, String> configOptions)
     {
         this(databaseConnectionConfig, new GenericJdbcConnectionFactory(databaseConnectionConfig,
                 JDBC_PROPERTIES, new DatabaseConnectionInfo(SnowflakeConstants.SNOWFLAKE_DRIVER_CLASS,
-                SnowflakeConstants.SNOWFLAKE_DEFAULT_PORT)));
+                SnowflakeConstants.SNOWFLAKE_DEFAULT_PORT)), configOptions);
     }
 
     @VisibleForTesting
-    protected SnowflakeMetadataHandler(final DatabaseConnectionConfig databaseConnectionConfig, final AWSSecretsManager secretsManager,
-                                       AmazonAthena athena, final JdbcConnectionFactory jdbcConnectionFactory)
+    protected SnowflakeMetadataHandler(
+        DatabaseConnectionConfig databaseConnectionConfig,
+        SecretsManagerClient secretsManager,
+        AthenaClient athena,
+        JdbcConnectionFactory jdbcConnectionFactory,
+        java.util.Map<String, String> configOptions)
     {
-        super(databaseConnectionConfig, secretsManager, athena, jdbcConnectionFactory);
+        super(databaseConnectionConfig, secretsManager, athena, jdbcConnectionFactory, configOptions);
     }
 
-    public SnowflakeMetadataHandler(final DatabaseConnectionConfig databaseConnectionConfig, final JdbcConnectionFactory jdbcConnectionFactory)
+    @Override
+    public GetDataSourceCapabilitiesResponse doGetDataSourceCapabilities(BlockAllocator allocator, GetDataSourceCapabilitiesRequest request)
     {
-        super(databaseConnectionConfig, jdbcConnectionFactory);
+        ImmutableMap.Builder<String, List<OptimizationSubType>> capabilities = ImmutableMap.builder();
+
+        capabilities.put(DataSourceOptimizations.SUPPORTS_FILTER_PUSHDOWN.withSupportedSubTypes(
+                FilterPushdownSubType.SORTED_RANGE_SET, FilterPushdownSubType.NULLABLE_COMPARISON
+        ));
+        capabilities.put(DataSourceOptimizations.SUPPORTS_LIMIT_PUSHDOWN.withSupportedSubTypes(
+                LimitPushdownSubType.INTEGER_CONSTANT
+        ));
+        capabilities.put(DataSourceOptimizations.SUPPORTS_COMPLEX_EXPRESSION_PUSHDOWN.withSupportedSubTypes(
+                ComplexExpressionPushdownSubType.SUPPORTED_FUNCTION_EXPRESSION_TYPES
+                        .withSubTypeProperties(Arrays.stream(StandardFunctions.values())
+                                .map(standardFunctions -> standardFunctions.getFunctionName().getFunctionName())
+                                .toArray(String[]::new))
+        ));
+        capabilities.put(DataSourceOptimizations.SUPPORTS_TOP_N_PUSHDOWN.withSupportedSubTypes(
+                TopNPushdownSubType.SUPPORTS_ORDER_BY
+        ));
+
+        jdbcQueryPassthrough.addQueryPassthroughCapabilityIfEnabled(capabilities, configOptions);
+        return new GetDataSourceCapabilitiesResponse(request.getCatalogName(), capabilities.build());
+    }
+
+    public SnowflakeMetadataHandler(DatabaseConnectionConfig databaseConnectionConfig, JdbcConnectionFactory jdbcConnectionFactory, java.util.Map<String, String> configOptions)
+    {
+        super(databaseConnectionConfig, jdbcConnectionFactory, configOptions);
     }
 
     @Override
@@ -141,6 +184,48 @@ public class SnowflakeMetadataHandler extends JdbcMetadataHandler
                 .addField(BLOCK_PARTITION_COLUMN_NAME, Types.MinorType.VARCHAR.getType());
         return schemaBuilder.build();
     }
+
+    private Optional<String> getPrimaryKey(TableName tableName) throws Exception 
+    {
+        List<String> primaryKeys = new ArrayList<String>();
+        try (Connection connection = getJdbcConnectionFactory().getConnection(getCredentialProvider())) {
+            try (PreparedStatement preparedStatement = connection.prepareStatement(SHOW_PRIMARY_KEYS_QUERY + tableName.getTableName());
+                ResultSet rs = preparedStatement.executeQuery()) {
+                while (rs.next()) {
+                    // Concatenate multiple primary keys if they exist
+                    primaryKeys.add(rs.getString(PRIMARY_KEY_COLUMN_NAME));
+                }
+            }
+        }
+        String primaryKey = String.join(", ", primaryKeys);
+        if (!Strings.isNullOrEmpty(primaryKey) && hasUniquePrimaryKey(tableName, primaryKey)) {
+            return Optional.of(primaryKey);
+        }
+        return Optional.empty(); 
+    }
+
+    /**
+    * Snowflake does not enforce primary key constraints, so we double-check user has unique primary key
+    * before partitioning.
+    */
+    private boolean hasUniquePrimaryKey(TableName tableName, String primaryKey) throws Exception 
+    {
+        try (Connection connection = getJdbcConnectionFactory().getConnection(getCredentialProvider())) {
+            try (PreparedStatement preparedStatement = connection.prepareStatement("SELECT " + primaryKey +  ", count(*) as COUNTS FROM " + tableName.getTableName() + " GROUP BY " + primaryKey + " ORDER BY COUNTS DESC"); 
+                 ResultSet rs = preparedStatement.executeQuery()) {
+                if (rs.next()) {
+                    if (rs.getInt(COUNTS_COLUMN_NAME) == 1) {
+                        // Since it is in descending order and 1 is this first count seen, 
+                        // this table has a unique primary key 
+                        return true;
+                    }   
+                }
+            }
+        }
+        LOGGER.warn("Primary key ,{}, is not unique. Falling back to single partition...", primaryKey);
+        return false;
+    }
+
     /**
      * Snowflake manual partition logic based upon number of records
      * @param blockWriter
@@ -155,14 +240,10 @@ public class SnowflakeMetadataHandler extends JdbcMetadataHandler
         LOGGER.info("{}: Schema {}, table {}", getTableLayoutRequest.getQueryId(), getTableLayoutRequest.getTableName().getSchemaName(),
                 getTableLayoutRequest.getTableName().getTableName());
         /**
-         * "PARTITION_RECORD_COUNT" is currently set to 500000.
-         * It means there will be 500000 rows per partition. The number of partition will be total number of rows divided by
-         * PARTITION_RECORD_COUNT variable value.
          * "MAX_PARTITION_COUNT" is currently set to 50 to limit the number of partitions.
          * this is to handle timeout issues because of huge partitions
          */
         LOGGER.info(" Total Partition Limit" + MAX_PARTITION_COUNT);
-        LOGGER.info(" Total Page  Count" +  PARTITION_RECORD_COUNT);
         boolean viewFlag = checkForView(getTableLayoutRequest);
         //if the input table is a view , there will be single split
         if (viewFlag) {
@@ -181,47 +262,29 @@ public class SnowflakeMetadataHandler extends JdbcMetadataHandler
                          .withQuery(COUNT_RECORDS_QUERY).withParameters(parameters).build();
                  ResultSet rs = preparedStatement.executeQuery()) {
                 while (rs.next()) {
-                    totalRecordCount = rs.getInt(1);
+                    totalRecordCount = rs.getLong(1);
                 }
                 if (totalRecordCount > 0) {
-                    // if number of partitions are more than defined limit "MAX_PARTITION_COUNT"
-                    // it will do maximum 50 partitions,49 partitions will have 500000 records each and last partition will have the remaining number of records.
-                    double limitValue = totalRecordCount / PARTITION_RECORD_COUNT;
-                    double limit = (int) Math.ceil(limitValue);
+                    Optional<String> primaryKey = getPrimaryKey(getTableLayoutRequest.getTableName());
+                    long recordsInPartition = (long) (Math.ceil(totalRecordCount / MAX_PARTITION_COUNT));
+                    long partitionRecordCount = (totalRecordCount <= SINGLE_SPLIT_LIMIT_COUNT || !primaryKey.isPresent()) ? (long) totalRecordCount : recordsInPartition;
+                    LOGGER.info(" Total Page Count: " +  partitionRecordCount);
+                    double numberOfPartitions = (int) Math.ceil(totalRecordCount / partitionRecordCount);
                     long offset = 0;
-                    if (limit > MAX_PARTITION_COUNT) {
-                        for (int i = 1; i <= MAX_PARTITION_COUNT; i++) {
-                            int partitionRecord = PARTITION_RECORD_COUNT;
-                            if (i == MAX_PARTITION_COUNT) {
-                                //Updating partitionRecord variable to display the remaining records in the last partition.
-                                //we get the value by subtracting the records displayed till 49th partition from the total number of records.
-                                partitionRecord = (int) totalRecordCount - (PARTITION_RECORD_COUNT * (MAX_PARTITION_COUNT - 1));
-                            }
-                            final String partitionVal = BLOCK_PARTITION_COLUMN_NAME + "-limit-" + partitionRecord + "-offset-" + offset;
-                            LOGGER.info("partitionVal {} ", partitionVal);
-                            blockWriter.writeRows((Block block, int rowNum) ->
-                            {
-                                block.setValue(BLOCK_PARTITION_COLUMN_NAME, rowNum, partitionVal);
-                                return 1;
-                            });
-                            offset = offset + PARTITION_RECORD_COUNT;
-                        }
-                    }
-                    else {
-                        /**
-                         * Custom pagination based partition logic will be applied with limit and offset clauses.
-                         * the partition values we are setting the limit and offset values like p-limit-3000-offset-0
-                         */
-                        for (int i = 1; i <= limit; i++) {
-                            final String partitionVal = BLOCK_PARTITION_COLUMN_NAME + "-limit-" + PARTITION_RECORD_COUNT + "-offset-" + offset;
-                            LOGGER.info("partitionVal {} ", partitionVal);
-                            blockWriter.writeRows((Block block, int rowNum) ->
-                            {
-                                block.setValue(BLOCK_PARTITION_COLUMN_NAME, rowNum, partitionVal);
-                                return 1;
-                            });
-                            offset = offset + PARTITION_RECORD_COUNT;
-                        }
+                    /**
+                     * Custom pagination based partition logic will be applied with limit and offset clauses.
+                     * It will have maximum 50 partitions and number of records in each partition is decided by dividing total number of records by 50
+                     * the partition values we are setting the limit and offset values like p-limit-3000-offset-0
+                     */
+                    for (int i = 1; i <= numberOfPartitions; i++) { 
+                        final String partitionVal = BLOCK_PARTITION_COLUMN_NAME + "-primary-" + primaryKey.orElse("") + "-limit-" + partitionRecordCount + "-offset-" + offset;
+                        LOGGER.info("partitionVal {} ", partitionVal);
+                        blockWriter.writeRows((Block block, int rowNum) ->
+                        {
+                            block.setValue(BLOCK_PARTITION_COLUMN_NAME, rowNum, partitionVal);
+                            return 1;
+                        });
+                        offset = offset + partitionRecordCount;
                     }
                 }
                 else {
@@ -257,6 +320,10 @@ public class SnowflakeMetadataHandler extends JdbcMetadataHandler
     public GetSplitsResponse doGetSplits(BlockAllocator blockAllocator, GetSplitsRequest getSplitsRequest)
     {
         LOGGER.info("{}: Catalog {}, table {}", getSplitsRequest.getQueryId(), getSplitsRequest.getTableName().getSchemaName(), getSplitsRequest.getTableName().getTableName());
+        if (getSplitsRequest.getConstraints().isQueryPassThrough()) {
+            LOGGER.info("QPT Split Requested");
+            return setupQueryPassthroughSplit(getSplitsRequest);
+        }
         int partitionContd = decodeContinuationToken(getSplitsRequest);
         Set<Split> splits = new HashSet<>();
         Block partitions = getSplitsRequest.getPartitions();
@@ -346,18 +413,19 @@ public class SnowflakeMetadataHandler extends JdbcMetadataHandler
                 ArrowType columnType = JdbcArrowTypeConverter.toArrowType(
                         resultSet.getInt("DATA_TYPE"),
                         resultSet.getInt("COLUMN_SIZE"),
-                        resultSet.getInt("DECIMAL_DIGITS"));
+                        resultSet.getInt("DECIMAL_DIGITS"),
+                        configOptions);
                 String columnName = resultSet.getString(COLUMN_NAME);
                 String dataType = hashMap.get(columnName);
                 LOGGER.debug("columnName: " + columnName);
                 LOGGER.debug("dataType: " + dataType);
-                final Map<String, ArrowType> stringArrowTypeMap = Map.ofEntries(
-                        entry("INTEGER", Types.MinorType.INT.getType()),
-                        entry("DATE", Types.MinorType.DATEDAY.getType()),
-                        entry("TIMESTAMP", Types.MinorType.DATEMILLI.getType()),
-                        entry("TIMESTAMP_LTZ", Types.MinorType.DATEMILLI.getType()),
-                        entry("TIMESTAMP_NTZ", Types.MinorType.DATEMILLI.getType()),
-                        entry("TIMESTAMP_TZ", Types.MinorType.DATEMILLI.getType())
+                final Map<String, ArrowType> stringArrowTypeMap = com.google.common.collect.ImmutableMap.of(
+                    "INTEGER", (ArrowType) Types.MinorType.INT.getType(),
+                    "DATE", (ArrowType) Types.MinorType.DATEDAY.getType(),
+                    "TIMESTAMP", (ArrowType) Types.MinorType.DATEMILLI.getType(),
+                    "TIMESTAMP_LTZ", (ArrowType) Types.MinorType.DATEMILLI.getType(),
+                    "TIMESTAMP_NTZ", (ArrowType) Types.MinorType.DATEMILLI.getType(),
+                    "TIMESTAMP_TZ", (ArrowType) Types.MinorType.DATEMILLI.getType()
                 );
                 if (dataType != null && stringArrowTypeMap.containsKey(dataType.toUpperCase())) {
                     columnType = stringArrowTypeMap.get(dataType.toUpperCase());

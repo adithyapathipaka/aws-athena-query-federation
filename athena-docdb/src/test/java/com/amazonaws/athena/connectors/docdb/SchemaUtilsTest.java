@@ -20,6 +20,7 @@
 package com.amazonaws.athena.connectors.docdb;
 
 import com.amazonaws.athena.connector.lambda.domain.TableName;
+import com.google.common.collect.ImmutableMap;
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
@@ -36,8 +37,8 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.Assert.*;
-import static org.mockito.Matchers.anyInt;
-import static org.mockito.Matchers.anyObject;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -52,19 +53,17 @@ public class SchemaUtilsTest
         unsupported.put("unsupported_col1", new UnsupportedType());
         docs.add(unsupported);
 
-        MongoClient mockClient = mock(MongoClient.class);
         MongoDatabase mockDatabase = mock(MongoDatabase.class);
         MongoCollection mockCollection = mock(MongoCollection.class);
         FindIterable mockIterable = mock(FindIterable.class);
-        when(mockClient.getDatabase(anyObject())).thenReturn(mockDatabase);
-        when(mockDatabase.getCollection(anyObject())).thenReturn(mockCollection);
+        when(mockDatabase.getCollection(any())).thenReturn(mockCollection);
         when(mockCollection.find()).thenReturn(mockIterable);
         when(mockIterable.limit(anyInt())).thenReturn(mockIterable);
         when(mockIterable.maxScan(anyInt())).thenReturn(mockIterable);
         when(mockIterable.batchSize(anyInt())).thenReturn(mockIterable);
         when(mockIterable.iterator()).thenReturn(new StubbingCursor(docs.iterator()));
 
-        Schema schema = SchemaUtils.inferSchema(mockClient, new TableName("test", "test"), 10);
+        Schema schema = SchemaUtils.inferSchema(mockDatabase, new TableName("test", "test"), 10);
         assertEquals(1, schema.getFields().size());
 
         Map<String, Field> fields = new HashMap<>();
@@ -115,19 +114,17 @@ public class SchemaUtilsTest
         doc3.put("col5", list);
         docs.add(doc3);
 
-        MongoClient mockClient = mock(MongoClient.class);
         MongoDatabase mockDatabase = mock(MongoDatabase.class);
         MongoCollection mockCollection = mock(MongoCollection.class);
         FindIterable mockIterable = mock(FindIterable.class);
-        when(mockClient.getDatabase(anyObject())).thenReturn(mockDatabase);
-        when(mockDatabase.getCollection(anyObject())).thenReturn(mockCollection);
+        when(mockDatabase.getCollection(any())).thenReturn(mockCollection);
         when(mockCollection.find()).thenReturn(mockIterable);
         when(mockIterable.limit(anyInt())).thenReturn(mockIterable);
         when(mockIterable.maxScan(anyInt())).thenReturn(mockIterable);
         when(mockIterable.batchSize(anyInt())).thenReturn(mockIterable);
         when(mockIterable.iterator()).thenReturn(new StubbingCursor(docs.iterator()));
 
-        Schema schema = SchemaUtils.inferSchema(mockClient, new TableName("test", "test"), 10);
+        Schema schema = SchemaUtils.inferSchema(mockDatabase, new TableName("test", "test"), 10);
         assertEquals(6, schema.getFields().size());
 
         Map<String, Field> fields = new HashMap<>();
@@ -167,19 +164,17 @@ public class SchemaUtilsTest
         doc2.put("col4", list2);
         docs.add(doc2);
 
-        MongoClient mockClient = mock(MongoClient.class);
         MongoDatabase mockDatabase = mock(MongoDatabase.class);
         MongoCollection mockCollection = mock(MongoCollection.class);
         FindIterable mockIterable = mock(FindIterable.class);
-        when(mockClient.getDatabase(anyObject())).thenReturn(mockDatabase);
-        when(mockDatabase.getCollection(anyObject())).thenReturn(mockCollection);
+        when(mockDatabase.getCollection(any())).thenReturn(mockCollection);
         when(mockCollection.find()).thenReturn(mockIterable);
         when(mockIterable.limit(anyInt())).thenReturn(mockIterable);
         when(mockIterable.maxScan(anyInt())).thenReturn(mockIterable);
         when(mockIterable.batchSize(anyInt())).thenReturn(mockIterable);
         when(mockIterable.iterator()).thenReturn(new StubbingCursor(docs.iterator()));
 
-        Schema schema = SchemaUtils.inferSchema(mockClient, new TableName("test", "test"), 10);
+        Schema schema = SchemaUtils.inferSchema(mockDatabase, new TableName("test", "test"), 10);
         assertEquals(4, schema.getFields().size());
 
         Map<String, Field> fields = new HashMap<>();

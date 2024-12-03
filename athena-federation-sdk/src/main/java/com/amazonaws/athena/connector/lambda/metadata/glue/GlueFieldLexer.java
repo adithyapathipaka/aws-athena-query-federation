@@ -21,6 +21,7 @@ package com.amazonaws.athena.connector.lambda.metadata.glue;
  */
 
 import com.amazonaws.athena.connector.lambda.data.FieldBuilder;
+import com.google.common.collect.ImmutableSet;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -48,11 +49,11 @@ public class GlueFieldLexer
 
     private static final String MAP = "map";
 
-    private static final Set<String> LIST_EQUIVALENTS = Set.of("array", "set");
+    private static final Set<String> LIST_EQUIVALENTS = ImmutableSet.of("array", "set");
 
     private static final BaseTypeMapper DEFAULT_TYPE_MAPPER = (String type) -> DefaultGlueType.toArrowType(type);
 
-    public static final boolean MAP_DISABLED = true;
+    public static final boolean MAP_DISABLED = false;
 
     private GlueFieldLexer() {}
 
@@ -159,11 +160,11 @@ public class GlueFieldLexer
 
         FieldType keyFieldTypeNotNullable = new FieldType(false, keyType.getType(), keyType.getDictionary(), keyType.getMetadata());
         Field keyFieldNotNullable = new Field(keyType.getName(), keyFieldTypeNotNullable, keyType.getChildren());
-
+      
         return FieldBuilder.newBuilder(name, new ArrowType.Map(false))
-             .addField("ENTRIES", Types.MinorType.STRUCT.getType(), false,
-                  Arrays.asList(keyFieldNotNullable, valueType))
-             .build();
+            .addField("entries", Types.MinorType.STRUCT.getType(), false,
+                Arrays.asList(keyFieldNotNullable, valueType))
+            .build();
     }
 
     private static void expectTokenMarkerIsFieldStart(GlueTypeParser.Token token)

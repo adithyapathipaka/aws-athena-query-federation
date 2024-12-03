@@ -19,8 +19,6 @@
  */
 package com.amazonaws.athena.connectors.elasticsearch;
 
-import com.amazonaws.auth.AWS4Signer;
-import com.amazonaws.auth.AWSCredentialsProvider;
 import com.google.common.base.Splitter;
 import org.apache.http.HttpHost;
 import org.apache.http.HttpRequestInterceptor;
@@ -41,10 +39,14 @@ import org.elasticsearch.client.RestHighLevelClient;
 import org.elasticsearch.client.indices.GetMappingsRequest;
 import org.elasticsearch.client.indices.GetMappingsResponse;
 import org.elasticsearch.cluster.health.ClusterHealthStatus;
-import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.cluster.metadata.MappingMetadata;
+import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.search.SearchHit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.http.auth.aws.signer.AwsV4HttpSigner;
+import software.amazon.awssdk.services.elasticsearch.ElasticsearchClient;
 
 import java.io.IOException;
 import java.util.LinkedHashMap;
@@ -85,6 +87,25 @@ public class AwsRestHighLevelClient
 
     /**
      * Gets the mapping for the specified index.
+     * For regular index name (table name in Athena), the index name equals to the actual index in ES.
+     *
+     * For data stream, data stream index does not equals to actual index names, ES created and managed indices for a data stream based on time. therefore, if we use data stream name to find mapping, we will not able to find it.
+     * In addition, data stream can contains multiple indices, it is hard to aggregate all the mapping into single giant mapping, we pick up the first index mapping we can find for data stream.
+     *
+     * Example : non data stream : "book"
+     * {
+     *  "book" : {
+     *    "mappings" : { .. }
+     * }
+     *
+     * Example: data stream : "datastream"
+     * {
+     *  ".ds-datastream_test1-000001" : {
+     *    "mappings" : {....}
+     *   },
+     *  ".ds-datastream_test1-12345678" : {
+     *    "mappings" : {....}
+     *   }
      * @param index is the index whose mapping will be retrieved.
      * @return a map containing all the mapping information for the specified index.
      * @throws IOException
@@ -95,8 +116,19 @@ public class AwsRestHighLevelClient
         GetMappingsRequest mappingsRequest = new GetMappingsRequest();
         mappingsRequest.indices(index);
         GetMappingsResponse mappingsResponse = indices().getMapping(mappingsRequest, RequestOptions.DEFAULT);
+        // non data stream mappingMetadata will return value because index name is same as underlying index used by ES.
+        MappingMetadata mappingMetadata = mappingsResponse.mappings().get(index);
+        // data stream case, index name is not same as underlying index managed by ES.
+        if (mappingMetadata == null) {
+            logger.info("Get first available mapping for data stream, data stream name: {}", index);
+            Map.Entry<String, MappingMetadata> dsmapping = mappingsResponse.mappings().entrySet()
+                    .stream()
+                    .findFirst()
+                    .orElseThrow(() -> new RuntimeException(String.format("Could not find mapping for data stream name: %s", index)));
+            mappingMetadata = dsmapping.getValue();
+        }
 
-        return (LinkedHashMap<String, Object>) mappingsResponse.mappings().get(index).sourceAsMap();
+        return (LinkedHashMap<String, Object>) mappingMetadata.getSourceAsMap();
     }
 
     /**
@@ -165,7 +197,7 @@ public class AwsRestHighLevelClient
     {
         private final String endpoint;
         private final RestClientBuilder clientBuilder;
-        private final AWS4Signer signer;
+        private final AwsV4HttpSigner signer;
         private final Splitter domainSplitter;
 
         /**
@@ -176,7 +208,7 @@ public class AwsRestHighLevelClient
         {
             this.endpoint = endpoint;
             this.clientBuilder = RestClient.builder(HttpHost.create(this.endpoint));
-            this.signer = new AWS4Signer();
+            this.signer = AwsV4HttpSigner.create();
             this.domainSplitter = Splitter.on(".");
         }
 
@@ -185,7 +217,7 @@ public class AwsRestHighLevelClient
          * @param credentialsProvider is the AWS credentials provider.
          * @return self.
          */
-        public Builder withCredentials(AWSCredentialsProvider credentialsProvider)
+        public Builder withCredentials(AwsCredentialsProvider credentialsProvider)
         {
             /**
              * endpoint:
@@ -200,16 +232,13 @@ public class AwsRestHighLevelClient
              */
             List<String> domainSplits = domainSplitter.splitToList(endpoint);
 
+            HttpRequestInterceptor interceptor;
             if (domainSplits.size() > 1) {
-                signer.setRegionName(domainSplits.get(1));
-                signer.setServiceName("es");
+                interceptor = new AWSRequestSigningApacheInterceptor(ElasticsearchClient.SERVICE_NAME, signer, credentialsProvider, domainSplits.get(1));
+
+                clientBuilder.setHttpClientConfigCallback(httpClientBuilder -> httpClientBuilder
+                        .addInterceptorLast(interceptor));
             }
-
-            HttpRequestInterceptor interceptor =
-                    new AWSRequestSigningApacheInterceptor(signer.getServiceName(), signer, credentialsProvider);
-
-            clientBuilder.setHttpClientConfigCallback(httpClientBuilder -> httpClientBuilder
-                    .addInterceptorLast(interceptor));
 
             return this;
         }

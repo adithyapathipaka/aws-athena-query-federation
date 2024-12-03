@@ -30,7 +30,7 @@ import com.amazonaws.athena.connector.lambda.data.writers.holders.NullableVarBin
 import com.amazonaws.athena.connector.lambda.data.writers.holders.NullableVarCharHolder;
 import com.amazonaws.athena.connectors.dynamodb.util.DDBRecordMetadata;
 import com.amazonaws.athena.connectors.dynamodb.util.DDBTypeUtils;
-import com.amazonaws.services.dynamodbv2.model.AttributeValue;
+
 import com.google.common.collect.ImmutableMap;
 import org.apache.arrow.vector.holders.NullableBitHolder;
 import org.apache.arrow.vector.types.Types;
@@ -40,10 +40,12 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.arrow.vector.types.pojo.Field;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -75,7 +77,6 @@ public class DDBTypeUtilsTest
         ddbRecordMetadata = mock(DDBRecordMetadata.class);
     }
 
-
     @Test
     public void makeDecimalExtractorTest()
             throws Exception
@@ -90,10 +91,8 @@ public class DDBTypeUtilsTest
         String literalValue = "12345";
         String literalValue2 = "789.1234";
 
-        AttributeValue myValue = new AttributeValue();
-        myValue.setN(literalValue);
-        AttributeValue myValue2 = new AttributeValue();
-        myValue2.setN(literalValue2);
+        AttributeValue myValue =  AttributeValue.builder().n(literalValue).build();
+        AttributeValue myValue2 = AttributeValue.builder().n(literalValue2).build();
 
         Map<String, AttributeValue> testValue = ImmutableMap.of(col1, myValue, col2, myValue2);
 
@@ -122,10 +121,13 @@ public class DDBTypeUtilsTest
         byte[] byteValue2 = "World!".getBytes();
         ByteBuffer byteBuffer2 = ByteBuffer.wrap(byteValue2);
 
-        AttributeValue myValue = new AttributeValue();
-        myValue.setB(byteBuffer1);
-        AttributeValue myValue2 = new AttributeValue();
-        myValue2.setB(byteBuffer2);
+        // Creating AttributeValue with binary data in SDK v2
+        AttributeValue myValue = AttributeValue.builder()
+                .b(SdkBytes.fromByteBuffer(byteBuffer1))
+                .build();
+        AttributeValue myValue2 = AttributeValue.builder()
+                .b(SdkBytes.fromByteBuffer(byteBuffer2))
+                .build();
 
         Map<String, AttributeValue> testValue = ImmutableMap.of(col1, myValue, col2, myValue2);
 
@@ -150,10 +152,12 @@ public class DDBTypeUtilsTest
                 .addField(col2, Types.MinorType.BIT.getType())
                 .build();
 
-        AttributeValue myValue = new AttributeValue();
-        myValue.setBOOL(true);
-        AttributeValue myValue2 = new AttributeValue();
-        myValue2.setBOOL(false);
+        AttributeValue myValue = AttributeValue.builder()
+                .bool(true)
+                .build();
+        AttributeValue myValue2 = AttributeValue.builder()
+                .bool(false)
+                .build();
 
         Map<String, AttributeValue> testValue = ImmutableMap.of(col1, myValue, col2, myValue2);
 
@@ -165,7 +169,21 @@ public class DDBTypeUtilsTest
         assertEquals("Extracted results are not as expected!", expectedResults, extractedResults);
         logger.info("makeBitExtractorTest - exit");
     }
+    
+    @Test
+    public void inferArrowFieldListWithNullTest() throws Exception
+    {
+        java.util.ArrayList inputArray = new java.util.ArrayList<String>();
+        inputArray.add("value1");
+        inputArray.add(null);
+        inputArray.add("value3");
 
+        Field testField = DDBTypeUtils.inferArrowField("asdf", DDBTypeUtils.toAttributeValue(inputArray));
+
+        assertEquals("Type does not match!", ArrowType.List.INSTANCE, testField.getType());
+        assertEquals("Children Length Off!", 1, testField.getChildren().size());
+        assertEquals("Wrong Child Type!", ArrowType.Utf8.INSTANCE, testField.getChildren().get(0).getType());
+    }
 
     private Map<String, Object> testField(Schema mapping, Map<String, AttributeValue> values)
             throws Exception

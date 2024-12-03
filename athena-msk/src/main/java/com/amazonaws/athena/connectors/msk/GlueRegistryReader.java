@@ -19,75 +19,72 @@
  */
 package com.amazonaws.athena.connectors.msk;
 
-import com.amazonaws.services.glue.AWSGlue;
-import com.amazonaws.services.glue.AWSGlueClientBuilder;
-import com.amazonaws.services.glue.model.GetSchemaRequest;
-import com.amazonaws.services.glue.model.GetSchemaResult;
-import com.amazonaws.services.glue.model.GetSchemaVersionRequest;
-import com.amazonaws.services.glue.model.GetSchemaVersionResult;
-import com.amazonaws.services.glue.model.ListSchemasRequest;
-import com.amazonaws.services.glue.model.ListSchemasResult;
-import com.amazonaws.services.glue.model.RegistryId;
-import com.amazonaws.services.glue.model.SchemaId;
-import com.amazonaws.services.glue.model.SchemaListItem;
-import com.amazonaws.services.glue.model.SchemaVersionNumber;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
-import java.util.List;
+import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.glue.model.GetSchemaRequest;
+import software.amazon.awssdk.services.glue.model.GetSchemaResponse;
+import software.amazon.awssdk.services.glue.model.GetSchemaVersionRequest;
+import software.amazon.awssdk.services.glue.model.GetSchemaVersionResponse;
+import software.amazon.awssdk.services.glue.model.SchemaId;
+import software.amazon.awssdk.services.glue.model.SchemaVersionNumber;
 
 public class GlueRegistryReader
 {
-    private final AWSGlue glue;
-    private final ObjectMapper objectMapper;
+    private static final ObjectMapper objectMapper;
 
-    public GlueRegistryReader()
-    {
-        this.objectMapper = new ObjectMapper();
-        glue = AWSGlueClientBuilder.defaultClient();
+    static {
+        objectMapper = new ObjectMapper();
         objectMapper.enable(DeserializationFeature.ACCEPT_EMPTY_STRING_AS_NULL_OBJECT);
+        objectMapper.disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
     }
 
     /**
      * Fetch glue schema content for latest version
-     * @param arn
+     * @param glueRegistryName
+     * @param glueSchemaName
      * @return
      */
-    public GetSchemaVersionResult getSchemaVersionResult(String arn)
+    public GetSchemaVersionResponse getSchemaVersionResult(String glueRegistryName, String glueSchemaName)
     {
-        SchemaId sid = new SchemaId().withSchemaArn(arn);
-        GetSchemaResult schemaResult = glue.getSchema(new GetSchemaRequest().withSchemaId(sid));
-        SchemaVersionNumber svn = new SchemaVersionNumber().withVersionNumber(schemaResult.getLatestSchemaVersion());
-        return glue.getSchemaVersion(new GetSchemaVersionRequest()
-                .withSchemaId(sid)
-                .withSchemaVersionNumber(svn)
+        GlueClient glue = GlueClient.create();
+        SchemaId sid = SchemaId.builder()
+                .registryName(glueRegistryName)
+                .schemaName(glueSchemaName)
+                .build();
+        GetSchemaResponse schemaResult = glue.getSchema(GetSchemaRequest.builder().schemaId(sid).build());
+        SchemaVersionNumber svn = SchemaVersionNumber.builder()
+                .versionNumber(schemaResult.latestSchemaVersion())
+                .build();
+        return glue.getSchemaVersion(GetSchemaVersionRequest.builder()
+                .schemaId(sid)
+                .schemaVersionNumber(svn)
+                .build()
         );
     }
     /**
      * fetch schema file content from glue schema.
      *
-     * @param arn
+     * @param glueRegistryName
+     * @param glueSchemaName
      * @param clazz
      * @param <T>
      * @return
      * @throws Exception
      */
-    public <T> T getGlueSchema(String arn, Class<T> clazz) throws Exception
+    public <T> T getGlueSchema(String glueRegistryName, String glueSchemaName, Class<T> clazz) throws Exception
     {
-        GetSchemaVersionResult result = getSchemaVersionResult(arn);
-        return objectMapper.readValue(result.getSchemaDefinition(), clazz);
+        GetSchemaVersionResponse result = getSchemaVersionResult(glueRegistryName, glueSchemaName);
+        return objectMapper.readValue(result.schemaDefinition(), clazz);
     }
-
-    /**
-     * Fetch Schema name and schema ARN from Glue schema registry
-     * @param registryNameArn
-     * @return
-     * Example
-     * schema-name: employee, schema-arn: arn:aws:glue:us-west-2:430676967608:schema/Athena-MSK/employee
-     */
-    public List<SchemaListItem> getSchemaListItemsWithSchemaRegistryARN(String registryNameArn)
+    public String getGlueSchemaType(String glueRegistryName, String glueSchemaName)
     {
-        ListSchemasResult result = glue.listSchemas(new ListSchemasRequest().withRegistryId(new RegistryId().withRegistryArn(registryNameArn)));
-        return result.getSchemas();
+        GetSchemaVersionResponse result = getSchemaVersionResult(glueRegistryName, glueSchemaName);
+        return result.dataFormatAsString();
+    }
+    public String getSchemaDef(String glueRegistryName, String glueSchemaName)
+    {
+        GetSchemaVersionResponse result = getSchemaVersionResult(glueRegistryName, glueSchemaName);
+        return result.schemaDefinition();
     }
 }

@@ -24,7 +24,6 @@ import com.amazonaws.athena.connectors.msk.dto.TopicResultSet;
 import com.amazonaws.athena.connectors.msk.serde.MskCsvDeserializer;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.kafka.common.errors.SerializationException;
 import org.junit.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -64,8 +63,6 @@ public class MskCsvDeserializerTest extends MskAbstractDeserializerTest
     private TopicSchema createCsvTopicSchema() throws JsonProcessingException
     {
         String csv = "{" +
-                "\"tableName\":\"test\"," +
-                "\"schemaName\":\"default\"," +
                 "\"topicName\":\"test\"," +
                 "\"message\":{" +
                 "\"dataFormat\":\"csv\"," +

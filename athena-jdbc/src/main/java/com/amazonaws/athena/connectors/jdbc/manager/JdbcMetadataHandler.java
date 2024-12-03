@@ -25,7 +25,9 @@ import com.amazonaws.athena.connector.lambda.data.BlockWriter;
 import com.amazonaws.athena.connector.lambda.data.FieldBuilder;
 import com.amazonaws.athena.connector.lambda.data.SchemaBuilder;
 import com.amazonaws.athena.connector.lambda.data.SupportedTypes;
+import com.amazonaws.athena.connector.lambda.domain.Split;
 import com.amazonaws.athena.connector.lambda.domain.TableName;
+import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocation;
 import com.amazonaws.athena.connector.lambda.handlers.MetadataHandler;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsResponse;
@@ -40,10 +42,9 @@ import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionConfig;
 import com.amazonaws.athena.connectors.jdbc.connection.JdbcConnectionFactory;
 import com.amazonaws.athena.connectors.jdbc.connection.JdbcCredentialProvider;
 import com.amazonaws.athena.connectors.jdbc.connection.RdsSecretsCredentialProvider;
+import com.amazonaws.athena.connectors.jdbc.qpt.JdbcQueryPassthrough;
 import com.amazonaws.athena.connectors.jdbc.splits.Splitter;
 import com.amazonaws.athena.connectors.jdbc.splits.SplitterFactory;
-import com.amazonaws.services.athena.AmazonAthena;
-import com.amazonaws.services.secretsmanager.AWSSecretsManager;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -55,17 +56,25 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Validate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.athena.AthenaClient;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+
+import static com.amazonaws.athena.connector.lambda.metadata.ListTablesRequest.UNLIMITED_PAGE_SIZE_VALUE;
 
 /**
  * Abstracts JDBC metadata handler and provides common reusable metadata handling.
@@ -76,33 +85,42 @@ public abstract class JdbcMetadataHandler
     private static final Logger LOGGER = LoggerFactory.getLogger(JdbcMetadataHandler.class);
     private static final String SQL_SPLITS_STRING = "select min(%s), max(%s) from %s.%s;";
     private static final int DEFAULT_NUM_SPLITS = 20;
+    public static final String TABLES_AND_VIEWS = "Tables and Views";
     private final JdbcConnectionFactory jdbcConnectionFactory;
     private final DatabaseConnectionConfig databaseConnectionConfig;
     private final SplitterFactory splitterFactory = new SplitterFactory();
+    protected JdbcQueryPassthrough jdbcQueryPassthrough = new JdbcQueryPassthrough();
 
     /**
      * Used only by Multiplexing handler. All calls will be delegated to respective database handler.
      */
-    protected JdbcMetadataHandler(String sourceType)
+    protected JdbcMetadataHandler(String sourceType, java.util.Map<String, String> configOptions)
     {
-        super(sourceType);
+        super(sourceType, configOptions);
         this.jdbcConnectionFactory = null;
         this.databaseConnectionConfig = null;
     }
 
-    protected JdbcMetadataHandler(final DatabaseConnectionConfig databaseConnectionConfig, final JdbcConnectionFactory jdbcConnectionFactory)
+    protected JdbcMetadataHandler(
+        DatabaseConnectionConfig databaseConnectionConfig,
+        JdbcConnectionFactory jdbcConnectionFactory,
+        java.util.Map<String, String> configOptions)
     {
-        super(databaseConnectionConfig.getEngine());
+        super(databaseConnectionConfig.getEngine(), configOptions);
         this.jdbcConnectionFactory = Validate.notNull(jdbcConnectionFactory, "jdbcConnectionFactory must not be null");
 
         this.databaseConnectionConfig = Validate.notNull(databaseConnectionConfig, "databaseConnectionConfig must not be null");
     }
 
     @VisibleForTesting
-    protected JdbcMetadataHandler(final DatabaseConnectionConfig databaseConnectionConfig, final AWSSecretsManager secretsManager,
-            final AmazonAthena athena, final JdbcConnectionFactory jdbcConnectionFactory)
+    protected JdbcMetadataHandler(
+        DatabaseConnectionConfig databaseConnectionConfig,
+        SecretsManagerClient secretsManager,
+        AthenaClient athena,
+        JdbcConnectionFactory jdbcConnectionFactory,
+        java.util.Map<String, String> configOptions)
     {
-        super(null, secretsManager, athena, databaseConnectionConfig.getEngine(), null, null);
+        super(null, secretsManager, athena, databaseConnectionConfig.getEngine(), null, null, configOptions);
         this.jdbcConnectionFactory = Validate.notNull(jdbcConnectionFactory, "jdbcConnectionFactory must not be null");
         this.databaseConnectionConfig = Validate.notNull(databaseConnectionConfig, "databaseConnectionConfig must not be null");
     }
@@ -154,19 +172,38 @@ public abstract class JdbcMetadataHandler
             throws Exception
     {
         try (Connection connection = jdbcConnectionFactory.getConnection(getCredentialProvider())) {
-            LOGGER.info("{}: List table names for Catalog {}, Table {}", listTablesRequest.getQueryId(), listTablesRequest.getCatalogName(), listTablesRequest.getSchemaName());
-            return new ListTablesResponse(listTablesRequest.getCatalogName(),
-                    listTables(connection, listTablesRequest.getSchemaName()), null);
+            LOGGER.info("{}: List table names for Catalog {}, Schema {}", listTablesRequest.getQueryId(),
+                    listTablesRequest.getCatalogName(), listTablesRequest.getSchemaName());
+
+            String token = listTablesRequest.getNextToken();
+            int pageSize = listTablesRequest.getPageSize();
+
+            if (pageSize == UNLIMITED_PAGE_SIZE_VALUE && token == null) { // perform no pagination
+                LOGGER.info("doListTables - NO pagination");
+                return new ListTablesResponse(listTablesRequest.getCatalogName(), listTables(connection, listTablesRequest.getSchemaName()), null);
+            }
+
+            LOGGER.info("doListTables - pagination");
+            return listPaginatedTables(connection, listTablesRequest);
         }
     }
 
-    private List<TableName> listTables(final Connection jdbcConnection, final String databaseName)
+    protected ListTablesResponse listPaginatedTables(final Connection connection, final ListTablesRequest listTablesRequest) throws SQLException
+    {
+        // no-op is call listTables
+        // override this function to implement pagination
+        LOGGER.debug("Request is asking for pagination, but pagination has not been implemented");
+        return new ListTablesResponse(listTablesRequest.getCatalogName(),
+                listTables(connection, listTablesRequest.getSchemaName()), null);
+    }
+
+    protected List<TableName> listTables(final Connection jdbcConnection, final String databaseName)
             throws SQLException
     {
         try (ResultSet resultSet = getTables(jdbcConnection, databaseName)) {
             ImmutableList.Builder<TableName> list = ImmutableList.builder();
             while (resultSet.next()) {
-                list.add(getSchemaTableName(resultSet));
+                list.add(JDBCUtil.getSchemaTableName(resultSet));
             }
             return list.build();
         }
@@ -181,15 +218,7 @@ public abstract class JdbcMetadataHandler
                 connection.getCatalog(),
                 escapeNamePattern(schemaName, escape),
                 null,
-                new String[] {"TABLE", "VIEW", "EXTERNAL TABLE"});
-    }
-
-    private TableName getSchemaTableName(final ResultSet resultSet)
-            throws SQLException
-    {
-        return new TableName(
-                resultSet.getString("TABLE_SCHEM"),
-                resultSet.getString("TABLE_NAME"));
+                new String[] {"TABLE", "VIEW", "EXTERNAL TABLE", "MATERIALIZED VIEW"});
     }
 
     protected String escapeNamePattern(final String name, final String escape)
@@ -211,13 +240,105 @@ public abstract class JdbcMetadataHandler
     {
         try (Connection connection = jdbcConnectionFactory.getConnection(getCredentialProvider())) {
             Schema partitionSchema = getPartitionSchema(getTableRequest.getCatalogName());
-            return new GetTableResponse(getTableRequest.getCatalogName(), getTableRequest.getTableName(), getSchema(connection, getTableRequest.getTableName(), partitionSchema),
-                    partitionSchema.getFields().stream().map(Field::getName).collect(Collectors.toSet()));
+            TableName caseInsensitiveTableMatch = caseInsensitiveTableSearch(connection, getTableRequest.getTableName().getSchemaName(),
+                    getTableRequest.getTableName().getTableName());
+            Schema caseInsensitiveSchemaMatch = getSchema(connection, caseInsensitiveTableMatch, partitionSchema);
+
+            return new GetTableResponse(getTableRequest.getCatalogName(), caseInsensitiveTableMatch, caseInsensitiveSchemaMatch,
+                        partitionSchema.getFields().stream().map(Field::getName).collect(Collectors.toSet()));
         }
     }
 
+    @Override
+    public GetTableResponse doGetQueryPassthroughSchema(final BlockAllocator blockAllocator, final GetTableRequest getTableRequest)
+            throws Exception
+    {
+        if (!getTableRequest.isQueryPassthrough()) {
+            throw new IllegalArgumentException("No Query passed through [{}]" + getTableRequest);
+        }
+
+        jdbcQueryPassthrough.verify(getTableRequest.getQueryPassthroughArguments());
+        String customerPassedQuery = getTableRequest.getQueryPassthroughArguments().get(JdbcQueryPassthrough.QUERY);
+
+        try (Connection connection = getJdbcConnectionFactory().getConnection(getCredentialProvider())) {
+            PreparedStatement preparedStatement = connection.prepareStatement(customerPassedQuery);
+            ResultSetMetaData metadata = preparedStatement.getMetaData();
+            if (metadata == null) {
+                throw new UnsupportedOperationException("Query not supported: ResultSetMetaData not available for query: " + customerPassedQuery);
+            }
+            SchemaBuilder schemaBuilder = SchemaBuilder.newBuilder();
+
+            for (int columnIndex = 1; columnIndex <= metadata.getColumnCount(); columnIndex++) {
+                String columnName = metadata.getColumnName(columnIndex);
+                String columnLabel = metadata.getColumnLabel(columnIndex);
+                //todo; is there a mechanism to pass both back to the engine?
+                columnName = columnName.equals(columnLabel) ? columnName : columnLabel;
+
+                int precision = metadata.getPrecision(columnIndex);
+                ArrowType columnType = convertDatasourceTypeToArrow(columnIndex, precision, configOptions, metadata);
+
+                if (columnType != null && SupportedTypes.isSupported(columnType)) {
+                    if (columnType instanceof ArrowType.List) {
+                        schemaBuilder.addListField(columnName, getArrayArrowTypeFromTypeName(
+                                metadata.getTableName(columnIndex),
+                                metadata.getColumnDisplaySize(columnIndex),
+                                precision));
+                    }
+                    else {
+                        schemaBuilder.addField(FieldBuilder.newBuilder(columnName, columnType).build());
+                    }
+                }
+                else {
+                    // Default to VARCHAR ArrowType
+                    LOGGER.warn("getSchema: Unable to map type for column[" + columnName +
+                            "] to a supported type, attempted " + columnType + " - defaulting type to VARCHAR.");
+                    schemaBuilder.addField(FieldBuilder.newBuilder(columnName, new ArrowType.Utf8()).build());
+                }
+            }
+
+            Schema schema = schemaBuilder.build();
+            return new GetTableResponse(getTableRequest.getCatalogName(), getTableRequest.getTableName(), schema, Collections.emptySet());
+        }
+    }
+
+    /**
+     * A method that takes in a JDBC type; and converts it to Arrow Type
+     * This can be overriden by other Metadata Handlers extending JDBC
+     *
+     * @param columnIndex
+     * @param precision
+     * @param configOptions
+     * @param metadata
+     * @return Arrow Type
+     */
+    protected ArrowType convertDatasourceTypeToArrow(int columnIndex, int precision, Map<String, String> configOptions, ResultSetMetaData metadata) throws SQLException
+    {
+        int scale = metadata.getScale(columnIndex);
+        int columnType = metadata.getColumnType(columnIndex);
+
+        return JdbcArrowTypeConverter.toArrowType(
+                columnType,
+                precision,
+                scale,
+                configOptions);
+    }
+
+    /**
+     * While being a no-op by default, this function will be overriden by subclasses that support this search.
+     *
+     * @param connection
+     * @param databaseName
+     * @param tableName
+     * @return TableName containing the resolved case sensitive table name.
+     */
+    protected TableName caseInsensitiveTableSearch(Connection connection, final String databaseName,
+                                                     final String tableName) throws Exception
+    {
+        return new TableName(databaseName, tableName);
+    }
+
     private Schema getSchema(Connection jdbcConnection, TableName tableName, Schema partitionSchema)
-            throws SQLException
+            throws Exception
     {
         SchemaBuilder schemaBuilder = SchemaBuilder.newBuilder();
 
@@ -227,7 +348,8 @@ public abstract class JdbcMetadataHandler
                 ArrowType columnType = JdbcArrowTypeConverter.toArrowType(
                         resultSet.getInt("DATA_TYPE"),
                         resultSet.getInt("COLUMN_SIZE"),
-                        resultSet.getInt("DECIMAL_DIGITS"));
+                        resultSet.getInt("DECIMAL_DIGITS"),
+                        configOptions);
                 String columnName = resultSet.getString("COLUMN_NAME");
                 if (columnType != null && SupportedTypes.isSupported(columnType)) {
                     if (columnType instanceof ArrowType.List) {
@@ -250,7 +372,7 @@ public abstract class JdbcMetadataHandler
             }
 
             if (!found) {
-                throw new RuntimeException("Could not find table in " + tableName.getSchemaName());
+                throw new RuntimeException(String.format("Could not find table %s in %s", tableName.getTableName(), tableName.getSchemaName()));
             }
 
             // add partition columns
@@ -333,5 +455,22 @@ public abstract class JdbcMetadataHandler
     {
         // Default ARRAY type is VARCHAR.
         return new ArrowType.Utf8();
+    }
+
+    /**
+     * Helper function that provides a single partition for Query Pass-Through
+     *
+     */
+    protected GetSplitsResponse setupQueryPassthroughSplit(GetSplitsRequest request)
+    {
+        //Every split must have a unique location if we wish to spill to avoid failures
+        SpillLocation spillLocation = makeSpillLocation(request);
+
+        //Since this is QPT query we return a fixed split.
+        Map<String, String> qptArguments = request.getConstraints().getQueryPassthroughArguments();
+        return new GetSplitsResponse(request.getCatalogName(),
+                Split.newBuilder(spillLocation, makeEncryptionKey())
+                        .applyProperties(qptArguments)
+                        .build());
     }
 }

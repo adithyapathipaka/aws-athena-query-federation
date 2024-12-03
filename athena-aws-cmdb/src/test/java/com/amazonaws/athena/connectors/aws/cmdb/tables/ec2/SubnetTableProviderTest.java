@@ -23,20 +23,20 @@ import com.amazonaws.athena.connector.lambda.data.Block;
 import com.amazonaws.athena.connector.lambda.data.BlockUtils;
 import com.amazonaws.athena.connectors.aws.cmdb.tables.AbstractTableProviderTest;
 import com.amazonaws.athena.connectors.aws.cmdb.tables.TableProvider;
-import com.amazonaws.services.ec2.AmazonEC2;
-import com.amazonaws.services.ec2.model.DescribeSubnetsRequest;
-import com.amazonaws.services.ec2.model.DescribeSubnetsResult;
-import com.amazonaws.services.ec2.model.Subnet;
-import com.amazonaws.services.ec2.model.Tag;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.invocation.InvocationOnMock;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ec2.model.DescribeSubnetsRequest;
+import software.amazon.awssdk.services.ec2.model.DescribeSubnetsResponse;
+import software.amazon.awssdk.services.ec2.model.Subnet;
+import software.amazon.awssdk.services.ec2.model.Tag;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -44,8 +44,7 @@ import java.util.List;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
-import static org.mockito.Mockito.mock;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.when;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -55,7 +54,7 @@ public class SubnetTableProviderTest
     private static final Logger logger = LoggerFactory.getLogger(SubnetTableProviderTest.class);
 
     @Mock
-    private AmazonEC2 mockEc2;
+    private Ec2Client mockEc2;
 
     protected String getIdField()
     {
@@ -90,18 +89,15 @@ public class SubnetTableProviderTest
     @Override
     protected void setUpRead()
     {
-        when(mockEc2.describeSubnets(any(DescribeSubnetsRequest.class))).thenAnswer((InvocationOnMock invocation) -> {
+        when(mockEc2.describeSubnets(nullable(DescribeSubnetsRequest.class))).thenAnswer((InvocationOnMock invocation) -> {
             DescribeSubnetsRequest request = (DescribeSubnetsRequest) invocation.getArguments()[0];
 
-            assertEquals(getIdValue(), request.getSubnetIds().get(0));
-            DescribeSubnetsResult mockResult = mock(DescribeSubnetsResult.class);
+            assertEquals(getIdValue(), request.subnetIds().get(0));
             List<Subnet> values = new ArrayList<>();
             values.add(makeSubnet(getIdValue()));
             values.add(makeSubnet(getIdValue()));
             values.add(makeSubnet("fake-id"));
-            when(mockResult.getSubnets()).thenReturn(values);
-
-            return mockResult;
+            return DescribeSubnetsResponse.builder().subnets(values).build();
         });
     }
 
@@ -157,16 +153,16 @@ public class SubnetTableProviderTest
 
     private Subnet makeSubnet(String id)
     {
-        return new Subnet()
-                .withSubnetId(id)
-                .withAvailabilityZone("availability_zone")
-                .withCidrBlock("cidr_block")
-                .withAvailableIpAddressCount(100)
-                .withDefaultForAz(true)
-                .withMapPublicIpOnLaunch(true)
-                .withOwnerId("owner")
-                .withState("state")
-                .withTags(new Tag().withKey("key").withValue("value"))
-                .withVpcId("vpc");
+        return Subnet.builder()
+                .subnetId(id)
+                .availabilityZone("availability_zone")
+                .cidrBlock("cidr_block")
+                .availableIpAddressCount(100)
+                .defaultForAz(true)
+                .mapPublicIpOnLaunch(true)
+                .ownerId("owner")
+                .state("state")
+                .tags(Tag.builder().key("key").value("value").build())
+                .vpcId("vpc").build();
     }
 }

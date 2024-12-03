@@ -19,6 +19,7 @@
  * #L%
  */
 package com.amazonaws.athena.connectors.saphana;
+
 import com.amazonaws.athena.connector.lambda.QueryStatusChecker;
 import com.amazonaws.athena.connector.lambda.data.Block;
 import com.amazonaws.athena.connector.lambda.data.BlockAllocator;
@@ -28,12 +29,21 @@ import com.amazonaws.athena.connector.lambda.data.SchemaBuilder;
 import com.amazonaws.athena.connector.lambda.data.SupportedTypes;
 import com.amazonaws.athena.connector.lambda.domain.Split;
 import com.amazonaws.athena.connector.lambda.domain.TableName;
+import com.amazonaws.athena.connector.lambda.domain.predicate.functions.StandardFunctions;
 import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocation;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesRequest;
+import com.amazonaws.athena.connector.lambda.metadata.GetDataSourceCapabilitiesResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableLayoutRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableResponse;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.DataSourceOptimizations;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.OptimizationSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.ComplexExpressionPushdownSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.FilterPushdownSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.LimitPushdownSubType;
+import com.amazonaws.athena.connector.lambda.metadata.optimizations.pushdown.TopNPushdownSubType;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionConfig;
 import com.amazonaws.athena.connectors.jdbc.connection.DatabaseConnectionInfo;
 import com.amazonaws.athena.connectors.jdbc.connection.GenericJdbcConnectionFactory;
@@ -42,9 +52,8 @@ import com.amazonaws.athena.connectors.jdbc.manager.JDBCUtil;
 import com.amazonaws.athena.connectors.jdbc.manager.JdbcArrowTypeConverter;
 import com.amazonaws.athena.connectors.jdbc.manager.JdbcMetadataHandler;
 import com.amazonaws.athena.connectors.jdbc.manager.PreparedStatementBuilder;
-import com.amazonaws.services.athena.AmazonAthena;
-import com.amazonaws.services.secretsmanager.AWSSecretsManager;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableMap;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -53,6 +62,8 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.athena.AthenaClient;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
@@ -75,29 +86,58 @@ public class SaphanaMetadataHandler extends JdbcMetadataHandler
 {
     private static final Logger LOGGER = LoggerFactory.getLogger(SaphanaMetadataHandler.class);
 
-    public SaphanaMetadataHandler()
+    public SaphanaMetadataHandler(java.util.Map<String, String> configOptions)
     {
-        this(JDBCUtil.getSingleDatabaseConfigFromEnv(SaphanaConstants.SAPHANA_NAME));
+        this(JDBCUtil.getSingleDatabaseConfigFromEnv(SaphanaConstants.SAPHANA_NAME, configOptions), configOptions);
     }
     /**
      * Used by Mux.
      */
-    public SaphanaMetadataHandler(final DatabaseConnectionConfig databaseConnectionConfig)
+    public SaphanaMetadataHandler(DatabaseConnectionConfig databaseConnectionConfig, java.util.Map<String, String> configOptions)
     {
         this(databaseConnectionConfig, new GenericJdbcConnectionFactory(databaseConnectionConfig,
                 SaphanaConstants.JDBC_PROPERTIES, new DatabaseConnectionInfo(SaphanaConstants.SAPHANA_DRIVER_CLASS,
-                SaphanaConstants.SAPHANA_DEFAULT_PORT)));
+                SaphanaConstants.SAPHANA_DEFAULT_PORT)), configOptions);
     }
     @VisibleForTesting
-    protected SaphanaMetadataHandler(final DatabaseConnectionConfig databaseConnectionConfig, final AWSSecretsManager secretsManager,
-                                     AmazonAthena athena, final JdbcConnectionFactory jdbcConnectionFactory)
+    protected SaphanaMetadataHandler(
+        DatabaseConnectionConfig databaseConnectionConfig,
+        SecretsManagerClient secretsManager,
+        AthenaClient athena,
+        JdbcConnectionFactory jdbcConnectionFactory,
+        java.util.Map<String, String> configOptions)
     {
-        super(databaseConnectionConfig, secretsManager, athena, jdbcConnectionFactory);
+        super(databaseConnectionConfig, secretsManager, athena, jdbcConnectionFactory, configOptions);
     }
 
-    public SaphanaMetadataHandler(DatabaseConnectionConfig databaseConnectionConfig, GenericJdbcConnectionFactory jdbcConnectionFactory)
+    public SaphanaMetadataHandler(DatabaseConnectionConfig databaseConnectionConfig, GenericJdbcConnectionFactory jdbcConnectionFactory, java.util.Map<String, String> configOptions)
     {
-            super(databaseConnectionConfig, jdbcConnectionFactory);
+            super(databaseConnectionConfig, jdbcConnectionFactory, configOptions);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public GetDataSourceCapabilitiesResponse doGetDataSourceCapabilities(BlockAllocator allocator, GetDataSourceCapabilitiesRequest request)
+    {
+        ImmutableMap.Builder<String, List<OptimizationSubType>> capabilities = ImmutableMap.builder();
+        capabilities.put(DataSourceOptimizations.SUPPORTS_FILTER_PUSHDOWN.withSupportedSubTypes(
+                FilterPushdownSubType.SORTED_RANGE_SET, FilterPushdownSubType.NULLABLE_COMPARISON
+        ));
+        capabilities.put(DataSourceOptimizations.SUPPORTS_LIMIT_PUSHDOWN.withSupportedSubTypes(
+                LimitPushdownSubType.INTEGER_CONSTANT
+        ));
+        capabilities.put(DataSourceOptimizations.SUPPORTS_COMPLEX_EXPRESSION_PUSHDOWN.withSupportedSubTypes(
+                ComplexExpressionPushdownSubType.SUPPORTED_FUNCTION_EXPRESSION_TYPES
+                        .withSubTypeProperties(Arrays.stream(StandardFunctions.values())
+                                .map(standardFunctions -> standardFunctions.getFunctionName().getFunctionName())
+                                .toArray(String[]::new))
+        ));
+
+        capabilities.put(DataSourceOptimizations.SUPPORTS_TOP_N_PUSHDOWN.withSupportedSubTypes(TopNPushdownSubType.SUPPORTS_ORDER_BY));
+
+        jdbcQueryPassthrough.addQueryPassthroughCapabilityIfEnabled(capabilities, configOptions);
+        return new GetDataSourceCapabilitiesResponse(request.getCatalogName(), capabilities.build());
     }
 
     @Override
@@ -190,6 +230,10 @@ public class SaphanaMetadataHandler extends JdbcMetadataHandler
     public GetSplitsResponse doGetSplits(BlockAllocator blockAllocator, GetSplitsRequest getSplitsRequest)
     {
         LOGGER.debug("{}: Catalog {}, table {}", getSplitsRequest.getQueryId(), getSplitsRequest.getTableName().getSchemaName(), getSplitsRequest.getTableName().getTableName());
+        if (getSplitsRequest.getConstraints().isQueryPassThrough()) {
+            LOGGER.info("QPT Split Requested");
+            return setupQueryPassthroughSplit(getSplitsRequest);
+        }
         int partitionContd = decodeContinuationToken(getSplitsRequest);
         Set<Split> splits = new HashSet<>();
         Block partitions = getSplitsRequest.getPartitions();
@@ -277,25 +321,26 @@ public class SaphanaMetadataHandler extends JdbcMetadataHandler
                 ArrowType columnType = JdbcArrowTypeConverter.toArrowType(
                         resultSet.getInt("DATA_TYPE"),
                         resultSet.getInt("COLUMN_SIZE"),
-                        resultSet.getInt("DECIMAL_DIGITS"));
+                        resultSet.getInt("DECIMAL_DIGITS"),
+                        configOptions);
 
                 LOGGER.debug("SaphanaMetadataHandler:getSchema column type of column {} is {}",
                         columnName, columnType);
                 String dataType = hashMap.get(columnName.toLowerCase());
                 LOGGER.debug("columnName: " + columnName);
                 LOGGER.debug("dataType: " + dataType);
-
-                InferredColumnType inferredColumnType = InferredColumnType.fromType(dataType);
-                columnType = inferredColumnType.columnType;
-                isSpatialDataType = inferredColumnType.isSpatialType;
-
                 /**
-                 * converting into VARCHAR not supported by Framework.
+                 * Converting ST_POINT/ST_GEOMETRY data type into VARCHAR
                  */
-                if (columnType == null) {
+                if (dataType != null
+                        && (dataType.contains("ST_POINT") || dataType.contains("ST_GEOMETRY"))) {
                     columnType = Types.MinorType.VARCHAR.getType();
+                    isSpatialDataType = true;
                 }
-                if (columnType != null && !SupportedTypes.isSupported(columnType)) {
+                /*
+                 * converting into VARCHAR for Unsupported data types.
+                 */
+                if ((columnType == null) || !SupportedTypes.isSupported(columnType)) {
                     columnType = Types.MinorType.VARCHAR.getType();
                 }
 
@@ -305,7 +350,7 @@ public class SaphanaMetadataHandler extends JdbcMetadataHandler
                     if (isSpatialDataType) {
                         schemaBuilder.addField(FieldBuilder.newBuilder(columnName, columnType)
                                 .addField(new Field(quoteColumnName(columnName) + TO_WELL_KNOWN_TEXT_FUNCTION,
-                                        new FieldType(true, columnType, null), List.of()))
+                                        new FieldType(true, columnType, null), com.google.common.collect.ImmutableList.of()))
                                 .build());
                     }
                     else {
@@ -442,59 +487,6 @@ public class SaphanaMetadataHandler extends JdbcMetadataHandler
         }
         else {
             return new TableName(table.getSchemaName().toUpperCase(), tableName.toUpperCase());
-        }
-    }
-
-    private static class InferredColumnType
-    {
-        private final ArrowType columnType;
-        private final boolean isSpatialType;
-        public InferredColumnType(ArrowType columnType, boolean isSpatialType)
-        {
-            this.columnType = columnType;
-            this.isSpatialType = isSpatialType;
-        }
-
-        private static InferredColumnType nullType()
-        {
-            return new InferredColumnType(null, false);
-        }
-
-        public static InferredColumnType fromType(String dataType)
-        {
-            if (dataType != null && (dataType.contains("DECIMAL"))) {
-                return new InferredColumnType(Types.MinorType.BIGINT.getType(), false);
-            }
-            if (dataType != null && (dataType.contains("INTEGER"))) {
-                return new InferredColumnType(Types.MinorType.INT.getType(), false);
-            }
-            if (dataType != null && (dataType.contains("date") || dataType.contains("DATE"))) {
-                return new InferredColumnType(Types.MinorType.DATEMILLI.getType(), false);
-            }
-            /**
-             * Converting TIMESTAMP data type into TIMESTAMPMILLI
-             */
-            if (dataType != null && (dataType.contains("TIMESTAMP"))
-            ) {
-                return new InferredColumnType(Types.MinorType.DATEMILLI.getType(), false);
-            }
-            /**
-             * Converting ST_POINT data type into VARBINARY
-             */
-            if (dataType != null
-                    && (dataType.contains("ST_POINT") || dataType.contains("ST_GEOMETRY"))
-            ) {
-                return new InferredColumnType(Types.MinorType.VARCHAR.getType(), true);
-            }
-            /**
-             * Converting DAYDATE data type into DATEDAY
-             */
-            if (dataType != null
-                    && (dataType.contains("DAYDATE") || dataType.contains("DATE"))
-            ) {
-                return new InferredColumnType(Types.MinorType.DATEDAY.getType(), true);
-            }
-            return nullType();
         }
     }
 

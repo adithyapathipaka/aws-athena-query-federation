@@ -21,26 +21,26 @@ package com.amazonaws.athena.connectors.aws.cmdb.tables;
 
 import com.amazonaws.athena.connector.lambda.data.Block;
 import com.amazonaws.athena.connector.lambda.data.BlockUtils;
-import com.amazonaws.services.elasticmapreduce.AmazonElasticMapReduce;
-import com.amazonaws.services.elasticmapreduce.model.Application;
-import com.amazonaws.services.elasticmapreduce.model.Cluster;
-import com.amazonaws.services.elasticmapreduce.model.ClusterStateChangeReason;
-import com.amazonaws.services.elasticmapreduce.model.ClusterStatus;
-import com.amazonaws.services.elasticmapreduce.model.ClusterSummary;
-import com.amazonaws.services.elasticmapreduce.model.DescribeClusterRequest;
-import com.amazonaws.services.elasticmapreduce.model.DescribeClusterResult;
-import com.amazonaws.services.elasticmapreduce.model.ListClustersRequest;
-import com.amazonaws.services.elasticmapreduce.model.ListClustersResult;
-import com.amazonaws.services.elasticmapreduce.model.Tag;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.invocation.InvocationOnMock;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.emr.EmrClient;
+import software.amazon.awssdk.services.emr.model.Application;
+import software.amazon.awssdk.services.emr.model.Cluster;
+import software.amazon.awssdk.services.emr.model.ClusterStateChangeReason;
+import software.amazon.awssdk.services.emr.model.ClusterStatus;
+import software.amazon.awssdk.services.emr.model.ClusterSummary;
+import software.amazon.awssdk.services.emr.model.DescribeClusterRequest;
+import software.amazon.awssdk.services.emr.model.DescribeClusterResponse;
+import software.amazon.awssdk.services.emr.model.ListClustersRequest;
+import software.amazon.awssdk.services.emr.model.ListClustersResponse;
+import software.amazon.awssdk.services.emr.model.Tag;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -48,8 +48,7 @@ import java.util.List;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
-import static org.mockito.Mockito.mock;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.when;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -59,7 +58,7 @@ public class EmrClusterTableProviderTest
     private static final Logger logger = LoggerFactory.getLogger(EmrClusterTableProviderTest.class);
 
     @Mock
-    private AmazonElasticMapReduce mockEmr;
+    private EmrClient mockEmr;
 
     protected String getIdField()
     {
@@ -94,26 +93,20 @@ public class EmrClusterTableProviderTest
     @Override
     protected void setUpRead()
     {
-        when(mockEmr.listClusters(any(ListClustersRequest.class)))
+        when(mockEmr.listClusters(nullable(ListClustersRequest.class)))
                 .thenAnswer((InvocationOnMock invocation) -> {
-                    ListClustersResult mockResult = mock(ListClustersResult.class);
                     List<ClusterSummary> values = new ArrayList<>();
                     values.add(makeClusterSummary(getIdValue()));
                     values.add(makeClusterSummary(getIdValue()));
                     values.add(makeClusterSummary("fake-id"));
-                    when(mockResult.getClusters()).thenReturn(values);
+                    ListClustersResponse mockResult = ListClustersResponse.builder().clusters(values).build();
                     return mockResult;
                 });
 
-        when(mockEmr.describeCluster(any(DescribeClusterRequest.class)))
+        when(mockEmr.describeCluster(nullable(DescribeClusterRequest.class)))
                 .thenAnswer((InvocationOnMock invocation) -> {
                     DescribeClusterRequest request = (DescribeClusterRequest) invocation.getArguments()[0];
-                    DescribeClusterResult mockResult = mock(DescribeClusterResult.class);
-                    List<ClusterSummary> values = new ArrayList<>();
-                    values.add(makeClusterSummary(getIdValue()));
-                    values.add(makeClusterSummary(getIdValue()));
-                    values.add(makeClusterSummary("fake-id"));
-                    when(mockResult.getCluster()).thenReturn(makeCluster(request.getClusterId()));
+                    DescribeClusterResponse mockResult = DescribeClusterResponse.builder().cluster(makeCluster(request.clusterId())).build();
                     return mockResult;
                 });
     }
@@ -170,32 +163,32 @@ public class EmrClusterTableProviderTest
 
     private ClusterSummary makeClusterSummary(String id)
     {
-        return new ClusterSummary()
-                .withName("name")
-                .withId(id)
-                .withStatus(new ClusterStatus()
-                        .withState("state")
-                        .withStateChangeReason(new ClusterStateChangeReason()
-                                .withCode("state_code")
-                                .withMessage("state_msg")))
-                .withNormalizedInstanceHours(100);
+        return ClusterSummary.builder()
+                .name("name")
+                .id(id)
+                .status(ClusterStatus.builder().state("state")
+                        .stateChangeReason(ClusterStateChangeReason.builder()
+                                .code("state_code")
+                                .message("state_msg").build()).build())
+                .normalizedInstanceHours(100).build();
     }
 
     private Cluster makeCluster(String id)
     {
-        return new Cluster()
-                .withId(id)
-                .withName("name")
-                .withAutoScalingRole("autoscaling_role")
-                .withCustomAmiId("custom_ami")
-                .withInstanceCollectionType("instance_collection_type")
-                .withLogUri("log_uri")
-                .withMasterPublicDnsName("master_public_dns")
-                .withReleaseLabel("release_label")
-                .withRunningAmiVersion("running_ami")
-                .withScaleDownBehavior("scale_down_behavior")
-                .withServiceRole("service_role")
-                .withApplications(new Application().withName("name").withVersion("version"))
-                .withTags(new Tag("key", "value"));
+        return Cluster.builder()
+                .id(id)
+                .name("name")
+                .autoScalingRole("autoscaling_role")
+                .customAmiId("custom_ami")
+                .instanceCollectionType("instance_collection_type")
+                .logUri("log_uri")
+                .masterPublicDnsName("master_public_dns")
+                .releaseLabel("release_label")
+                .runningAmiVersion("running_ami")
+                .scaleDownBehavior("scale_down_behavior")
+                .serviceRole("service_role")
+                .applications(Application.builder().name("name").version("version").build())
+                .tags(Tag.builder().key("key").value("value").build())
+                .build();
     }
 }

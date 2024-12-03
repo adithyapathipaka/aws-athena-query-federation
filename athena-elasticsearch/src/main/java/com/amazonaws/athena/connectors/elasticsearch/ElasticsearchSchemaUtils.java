@@ -147,6 +147,7 @@ class ElasticsearchSchemaUtils
             case "text":
             case "keyword":
             case "binary":
+            case "geo_point":
                 minorType = Types.MinorType.VARCHAR;
                 break;
             case "long":
@@ -161,6 +162,8 @@ class ElasticsearchSchemaUtils
             case "byte":
                 minorType = Types.MinorType.TINYINT;
                 break;
+            case "float":
+            case "half_float":
             case "double":
                 minorType = Types.MinorType.FLOAT8;
                 break;
@@ -168,10 +171,6 @@ class ElasticsearchSchemaUtils
                 // Store the scaling factor in the field's metadata map.
                 minorType = Types.MinorType.BIGINT;
                 metadata.put("scaling_factor", mapping.get("scaling_factor").toString());
-                break;
-            case "float":
-            case "half_float":
-                minorType = Types.MinorType.FLOAT4;
                 break;
             case "date":
             case "date_nanos":
